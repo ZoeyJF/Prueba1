@@ -619,7 +619,7 @@ static void log_found_match(const std::string &msg) {
 
     FoundLogEntry entry;
     entry.message = msg;
-    entry.remaining_cycles = 4;
+    entry.remaining_cycles = 2; // Displayed for 2 refresh cycles (30s)
     g_found_logs.push_back(entry);
 
     // Print immediately to console
@@ -1138,7 +1138,11 @@ int run_single_range(int bits) {
     std::vector<unsigned long long> prev_counts(g_num_threads, 0);
     g_display_lines = 0;
     int render_cycle = 0;
-    auto last_time = std::chrono::steady_clock::now();
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_time = start_time;
+
+    // Render initial dashboard immediately on startup so user does not wait 15 seconds
+    render_display(prev_counts, 0.0, bits, 0);
     auto next_render = last_time + std::chrono::seconds(15);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
