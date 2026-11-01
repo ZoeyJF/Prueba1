@@ -571,7 +571,7 @@ int main(int argc, char *argv[]) {
             double elapsed_ui = std::chrono::duration<double>(now - last_ui_update).count();
             if (elapsed_ui >= 0.25 || bytes_processed == file_size) {
                 double pct = file_size > 0 ? ((double)bytes_processed / (double)file_size) * 100.0 : 100.0;
-                printf("\r[Processing %zu/%zu] %s: %.1f%% | Lines: %lu | Extracted: %lu | Total: %lu | Chunks: %zu",
+                printf("\r\033[K[Processing %zu/%zu] %s: %.1f%% | Lines: %lu | Valid: %lu | Total: %lu | Chunks: %zu",
                        f_idx + 1, total_files, fname.c_str(), pct,
                        (unsigned long)lines_processed,
                        (unsigned long)valid_addresses_in_file,
@@ -588,7 +588,7 @@ int main(int argc, char *argv[]) {
 
         fclose(in_fp);
 
-        printf("\r[Completed %zu/%zu] %s: 100.0%% | Lines: %lu | Extracted: %lu | Total: %lu | Chunks: %zu\n",
+        printf("\r\033[K[Completed %zu/%zu] %s: 100.0%% | Lines: %lu | Valid: %lu | Total: %lu | Chunks: %zu\n",
                f_idx + 1, total_files, fname.c_str(),
                (unsigned long)lines_processed,
                (unsigned long)valid_addresses_in_file,
@@ -624,11 +624,14 @@ int main(int argc, char *argv[]) {
     double size_mb = (double)btc_hex_size / (1024.0 * 1024.0);
     double size_gb = (double)btc_hex_size / (1024.0 * 1024.0 * 1024.0);
 
+    uint64_t total_duplicates = (total_extracted >= total_unique) ? (total_extracted - total_unique) : 0;
+
     std::cout << "\n======================================================================\n";
     std::cout << "                 CONVERSION COMPLETE - SUMMARY                        \n";
     std::cout << "======================================================================\n";
     std::cout << " Total Files Processed : " << total_files << "\n";
     std::cout << " Total Addresses Read  : " << total_extracted << "\n";
+    std::cout << " Total Duplicates Found: " << total_duplicates << "\n";
     std::cout << " Total Unique Hashes   : " << total_unique << "\n";
     printf(" BTC.hex File Size     : %.2f MB (%.6f GB)\n", size_mb, size_gb);
     printf(" Total Execution Time  : %.2f s (%.2f min)\n", total_duration, total_duration / 60.0);
