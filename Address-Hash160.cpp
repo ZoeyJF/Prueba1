@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -25,11 +28,28 @@
 #include <cstdlib>
 #include <chrono>
 #include <algorithm>
+#include <queue>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "Secp256k1/sha256.h"
 #include "Secp256k1/ripemd160.h"
+
+// Chunk threshold: 2,000,000 hashes * 20 bytes = 40 MB RAM per chunk.
+// Keeps peak memory usage strictly bounded under 100 MB regardless of file sizes (6 GB to 60+ GB).
+static const size_t CHUNK_HASH_LIMIT = 2000000;
+static const size_t OUT_BUFFER_SIZE = 1024 * 1024;
+static const size_t STREAM_BUFFER_SIZE = 64 * 1024; // 64 KB per stream to prevent OOM with hundreds of chunks
+
+static std::string get_temp_dir() {
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && access(tmp, W_OK) == 0) return std::string(tmp);
+    if (access("/tmp", W_OK) == 0) return "/tmp";
+    return ".";
+}
+
+using Hash20 = std::array<uint8_t, 20>;
 
 static const int B58_MAP[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
@@ -111,8 +131,6 @@ static bool decode_base58_check(const char *str, size_t len, uint8_t *h160_out) 
         decoded[total_len - 1 - i] = bin[i];
     }
 
-    // Verify 1-byte version prefix is 0x00 (P2PKH) or 0x05 (P2SH)
-    // and verify double-SHA256 checksum
     uint8_t hash1[32], hash2[32];
     sha256(decoded, 21, hash1);
     sha256(hash1, 32, hash2);
@@ -172,8 +190,8 @@ static bool decode_bech32(const char *str, size_t len, uint8_t *h160_out) {
     if (pos_one != 2) return false;
 
     uint8_t values[128];
-    values[0] = 3; // ('b' | 'B') >> 5
-    values[1] = 3; // ('c' | 'C') >> 5
+    values[0] = 3;
+    values[1] = 3;
     values[2] = 0;
     values[3] = (uint8_t)(str[0] & 31);
     values[4] = (uint8_t)(str[1] & 31);
@@ -240,7 +258,180 @@ static void bytes_to_hex(const uint8_t *in, size_t len, char *out) {
     out[len * 2] = '\0';
 }
 
-using Hash20 = std::array<uint8_t, 20>;
+static int flush_chunk_to_temp_file(std::vector<Hash20> &chunk, int chunk_id, std::vector<std::string> &temp_files) {
+    if (chunk.empty()) return 0;
+
+    // Sort chunk lexicographically
+    std::sort(chunk.begin(), chunk.end(), [](const Hash20 &a, const Hash20 &b) {
+        return memcmp(a.data(), b.data(), 20) < 0;
+    });
+
+    // Deduplicate in chunk
+    auto last_it = std::unique(chunk.begin(), chunk.end(), [](const Hash20 &a, const Hash20 &b) {
+        return memcmp(a.data(), b.data(), 20) == 0;
+    });
+    chunk.erase(last_it, chunk.end());
+
+    std::string tdir = get_temp_dir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/addr_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        std::cerr << "\n[ERROR] Cannot open temp chunk file: " << path << std::endl;
+        return -1;
+    }
+
+    uint64_t bytes_to_write = chunk.size() * 20;
+    if ((uint64_t)write(fd, chunk.data(), bytes_to_write) != bytes_to_write) {
+        std::cerr << "\n[ERROR] Cannot write to temp chunk file: " << path << std::endl;
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+
+    close(fd);
+    temp_files.push_back(path);
+    chunk.clear();
+    return 0;
+}
+
+static uint64_t merge_temp_chunks_to_btc_hex(const std::vector<std::string> &temp_files) {
+    if (temp_files.empty()) return 0;
+
+    FILE *out_fp = fopen("BTC.hex", "wb");
+    if (!out_fp) {
+        std::cerr << "[ERROR] Cannot open BTC.hex for writing." << std::endl;
+        return 0;
+    }
+
+    struct ChunkStream {
+        int fd;
+        std::vector<uint8_t> buffer;
+        size_t buf_pos;
+        size_t buf_end;
+        uint8_t current_hash[20];
+        bool has_data;
+
+        ChunkStream() : fd(-1), buffer(STREAM_BUFFER_SIZE), buf_pos(0), buf_end(0), has_data(false) {}
+
+        bool read_next() {
+            if (fd < 0) return false;
+            if (buf_pos + 20 > buf_end) {
+                size_t rem = buf_end - buf_pos;
+                if (rem > 0) {
+                    memmove(buffer.data(), buffer.data() + buf_pos, rem);
+                }
+                ssize_t n = read(fd, buffer.data() + rem, STREAM_BUFFER_SIZE - rem);
+                if (n <= 0) {
+                    if (rem < 20) {
+                        has_data = false;
+                        return false;
+                    }
+                    buf_end = rem;
+                } else {
+                    buf_end = rem + n;
+                }
+                buf_pos = 0;
+            }
+            if (buf_pos + 20 <= buf_end) {
+                memcpy(current_hash, buffer.data() + buf_pos, 20);
+                buf_pos += 20;
+                has_data = true;
+                return true;
+            }
+            has_data = false;
+            return false;
+        }
+    };
+
+    std::vector<ChunkStream> streams(temp_files.size());
+    for (size_t i = 0; i < temp_files.size(); i++) {
+        streams[i].fd = open(temp_files[i].c_str(), O_RDONLY);
+        streams[i].buf_pos = 0;
+        streams[i].buf_end = 0;
+        streams[i].has_data = false;
+        if (streams[i].fd >= 0) {
+            streams[i].read_next();
+        }
+    }
+
+    struct StreamComparator {
+        std::vector<ChunkStream> &s;
+        StreamComparator(std::vector<ChunkStream> &streams_ref) : s(streams_ref) {}
+        bool operator()(int a, int b) const {
+            return memcmp(s[a].current_hash, s[b].current_hash, 20) > 0;
+        }
+    };
+
+    StreamComparator comp(streams);
+    std::priority_queue<int, std::vector<int>, StreamComparator> pq(comp);
+
+    for (size_t i = 0; i < streams.size(); i++) {
+        if (streams[i].has_data) {
+            pq.push((int)i);
+        }
+    }
+
+    char *out_buf = (char *)malloc(OUT_BUFFER_SIZE);
+    if (!out_buf) {
+        std::cerr << "[ERROR] Memory allocation failed for output buffer." << std::endl;
+        fclose(out_fp);
+        return 0;
+    }
+    size_t out_buf_pos = 0;
+
+    uint8_t prev_hash[20];
+    memset(prev_hash, 0xFF, 20);
+    bool has_prev = false;
+    uint64_t unique_count = 0;
+
+    while (!pq.empty()) {
+        int stream_idx = pq.top();
+        pq.pop();
+
+        uint8_t *curr = streams[stream_idx].current_hash;
+
+        if (!has_prev || memcmp(curr, prev_hash, 20) != 0) {
+            char hex_str[41];
+            bytes_to_hex(curr, 20, hex_str);
+
+            if (out_buf_pos + 41 > OUT_BUFFER_SIZE) {
+                fwrite(out_buf, 1, out_buf_pos, out_fp);
+                out_buf_pos = 0;
+            }
+            memcpy(out_buf + out_buf_pos, hex_str, 40);
+            out_buf_pos += 40;
+            out_buf[out_buf_pos++] = '\n';
+
+            memcpy(prev_hash, curr, 20);
+            has_prev = true;
+            unique_count++;
+        }
+
+        if (streams[stream_idx].read_next()) {
+            pq.push(stream_idx);
+        }
+    }
+
+    if (out_buf_pos > 0) {
+        fwrite(out_buf, 1, out_buf_pos, out_fp);
+    }
+
+    fflush(out_fp);
+    fclose(out_fp);
+    free(out_buf);
+
+    for (auto &st : streams) {
+        if (st.fd >= 0) close(st.fd);
+    }
+
+    for (const auto &path : temp_files) {
+        unlink(path.c_str());
+    }
+
+    return unique_count;
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -256,10 +447,12 @@ int main(int argc, char *argv[]) {
     auto start_time = std::chrono::steady_clock::now();
     size_t total_files = input_files.size();
 
-    std::vector<Hash20> all_hashes;
-    all_hashes.reserve(100000);
+    std::vector<Hash20> chunk;
+    chunk.reserve(CHUNK_HASH_LIMIT);
+    std::vector<std::string> temp_chunk_files;
+    int chunk_id = 0;
 
-    const size_t READ_BUF_SIZE = 1024 * 1024;
+    const size_t READ_BUF_SIZE = 4 * 1024 * 1024;
     char *read_buf = (char *)malloc(READ_BUF_SIZE);
     if (!read_buf) {
         std::cerr << "Error: Memory allocation failed for read buffer." << std::endl;
@@ -269,6 +462,8 @@ int main(int argc, char *argv[]) {
     std::cout << "======================================================================\n";
     std::cout << "        Universal Address & Hash160 Extractor and Sorter              \n";
     std::cout << "======================================================================\n";
+
+    uint64_t total_extracted = 0;
 
     for (size_t f_idx = 0; f_idx < total_files; f_idx++) {
         const std::string &fname = input_files[f_idx];
@@ -336,8 +531,13 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (found) {
-                    all_hashes.push_back(h);
+                    chunk.push_back(h);
                     valid_addresses_in_file++;
+                    total_extracted++;
+
+                    if (chunk.size() >= CHUNK_HASH_LIMIT) {
+                        flush_chunk_to_temp_file(chunk, chunk_id++, temp_chunk_files);
+                    }
                 }
 
                 start_pos = end_pos;
@@ -371,11 +571,12 @@ int main(int argc, char *argv[]) {
             double elapsed_ui = std::chrono::duration<double>(now - last_ui_update).count();
             if (elapsed_ui >= 0.25 || bytes_processed == file_size) {
                 double pct = file_size > 0 ? ((double)bytes_processed / (double)file_size) * 100.0 : 100.0;
-                printf("\r[Processing %zu/%zu] %s: %.1f%% | Lines: %lu | Extracted: %lu | Total: %zu",
+                printf("\r[Processing %zu/%zu] %s: %.1f%% | Lines: %lu | Extracted: %lu | Total: %lu | Chunks: %zu",
                        f_idx + 1, total_files, fname.c_str(), pct,
                        (unsigned long)lines_processed,
                        (unsigned long)valid_addresses_in_file,
-                       all_hashes.size());
+                       (unsigned long)total_extracted,
+                       temp_chunk_files.size());
                 fflush(stdout);
                 last_ui_update = now;
             }
@@ -387,72 +588,29 @@ int main(int argc, char *argv[]) {
 
         fclose(in_fp);
 
-        printf("\r[Completed %zu/%zu] %s: 100.0%% | Lines: %lu | Extracted: %lu | Total: %zu\n",
+        printf("\r[Completed %zu/%zu] %s: 100.0%% | Lines: %lu | Extracted: %lu | Total: %lu | Chunks: %zu\n",
                f_idx + 1, total_files, fname.c_str(),
                (unsigned long)lines_processed,
                (unsigned long)valid_addresses_in_file,
-               all_hashes.size());
+               (unsigned long)total_extracted,
+               temp_chunk_files.size());
         fflush(stdout);
     }
 
     free(read_buf);
 
-    std::cout << "\nSorting and deduplicating " << all_hashes.size() << " extracted hashes..." << std::endl;
-    auto sort_start = std::chrono::steady_clock::now();
-
-    // Strict lexicographical byte-by-byte sort via memcmp
-    std::sort(all_hashes.begin(), all_hashes.end(), [](const Hash20 &a, const Hash20 &b) {
-        return memcmp(a.data(), b.data(), 20) < 0;
-    });
-
-    // Deduplicate via std::unique
-    auto last_it = std::unique(all_hashes.begin(), all_hashes.end(), [](const Hash20 &a, const Hash20 &b) {
-        return memcmp(a.data(), b.data(), 20) == 0;
-    });
-    all_hashes.erase(last_it, all_hashes.end());
-
-    auto sort_end = std::chrono::steady_clock::now();
-    double sort_duration = std::chrono::duration<double>(sort_end - sort_start).count();
-    std::cout << "Sorting and deduplication finished in " << sort_duration << " s. Unique hashes: " << all_hashes.size() << std::endl;
-
-    // Output to BTC.hex as 40 lowercase hexadecimal characters per line
-    std::cout << "Writing unique hashes to BTC.hex..." << std::endl;
-    FILE *out_fp = fopen("BTC.hex", "wb");
-    if (!out_fp) {
-        std::cerr << "Error: Cannot open or create BTC.hex for writing." << std::endl;
-        return 1;
+    if (!chunk.empty()) {
+        flush_chunk_to_temp_file(chunk, chunk_id++, temp_chunk_files);
     }
 
-    const size_t OUT_BUF_SIZE = 1024 * 1024;
-    char *out_buf = (char *)malloc(OUT_BUF_SIZE);
-    if (!out_buf) {
-        std::cerr << "Error: Memory allocation failed for output buffer." << std::endl;
-        fclose(out_fp);
-        return 1;
-    }
-    size_t out_buf_pos = 0;
+    std::cout << "\nMerging and deduplicating " << temp_chunk_files.size() << " temporary chunk(s) to BTC.hex..." << std::endl;
+    auto merge_start = std::chrono::steady_clock::now();
 
-    for (const auto &h : all_hashes) {
-        char hex_str[41];
-        bytes_to_hex(h.data(), 20, hex_str);
+    uint64_t total_unique = merge_temp_chunks_to_btc_hex(temp_chunk_files);
 
-        if (out_buf_pos + 41 > OUT_BUF_SIZE) {
-            fwrite(out_buf, 1, out_buf_pos, out_fp);
-            out_buf_pos = 0;
-        }
-        memcpy(out_buf + out_buf_pos, hex_str, 40);
-        out_buf_pos += 40;
-        out_buf[out_buf_pos++] = '\n';
-    }
-
-    if (out_buf_pos > 0) {
-        fwrite(out_buf, 1, out_buf_pos, out_fp);
-        out_buf_pos = 0;
-    }
-
-    fflush(out_fp);
-    fclose(out_fp);
-    free(out_buf);
+    auto merge_end = std::chrono::steady_clock::now();
+    double merge_duration = std::chrono::duration<double>(merge_end - merge_start).count();
+    std::cout << "Merging completed in " << merge_duration << " s. Unique hashes: " << total_unique << std::endl;
 
     auto end_time = std::chrono::steady_clock::now();
     double total_duration = std::chrono::duration<double>(end_time - start_time).count();
@@ -470,7 +628,8 @@ int main(int argc, char *argv[]) {
     std::cout << "                 CONVERSION COMPLETE - SUMMARY                        \n";
     std::cout << "======================================================================\n";
     std::cout << " Total Files Processed : " << total_files << "\n";
-    std::cout << " Total Unique Hashes   : " << all_hashes.size() << "\n";
+    std::cout << " Total Addresses Read  : " << total_extracted << "\n";
+    std::cout << " Total Unique Hashes   : " << total_unique << "\n";
     printf(" BTC.hex File Size     : %.2f MB (%.6f GB)\n", size_mb, size_gb);
     printf(" Total Execution Time  : %.2f s (%.2f min)\n", total_duration, total_duration / 60.0);
     std::cout << " Output Saved To       : BTC.hex\n";

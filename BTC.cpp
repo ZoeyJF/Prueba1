@@ -502,10 +502,21 @@ static int load_database_files() {
     g_bin_size = bst.st_size;
 
     if (g_mem_mode_bin == 1) {
-        // Full in-memory buffer
+        // Full in-memory buffer: chunked read to support > 2 GB files safely
         g_bin_map = (uint8_t*)malloc(g_bin_size > 0 ? g_bin_size : 1);
         if (g_bin_map) {
-            if ((uint64_t)read(g_bin_fd, g_bin_map, g_bin_size) != g_bin_size) {
+            uint64_t total_read = 0;
+            bool read_err = false;
+            while (total_read < g_bin_size) {
+                size_t to_read = (g_bin_size - total_read > 64 * 1024 * 1024) ? (64 * 1024 * 1024) : (g_bin_size - total_read);
+                ssize_t n = pread64(g_bin_fd, g_bin_map + total_read, to_read, (off64_t)total_read);
+                if (n <= 0) {
+                    read_err = true;
+                    break;
+                }
+                total_read += n;
+            }
+            if (read_err || total_read != g_bin_size) {
                 free(g_bin_map);
                 g_bin_map = nullptr;
                 fprintf(stderr, "[WARN] Failed reading %s into RAM, falling back to pread64\n", BIN_FILE);
