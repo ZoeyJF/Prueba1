@@ -87,8 +87,10 @@ static int create_temp_chunk(std::vector<hash_entry> &chunk, int chunk_id) {
     });
     chunk.erase(last, chunk.end());
 
-    char filename[256];
-    snprintf(filename, sizeof(filename), "/tmp/btc_chunk_%d_%d.tmp", getpid(), chunk_id);
+    const char *tmp_env = getenv("TMPDIR");
+    std::string tdir = (tmp_env && access(tmp_env, W_OK) == 0) ? tmp_env : ((access("/tmp", W_OK) == 0) ? "/tmp" : ".");
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/btc_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
 
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -254,8 +256,10 @@ static int stage_read_and_sort_external(const char *hex_path, uint64_t *total_un
         total_valid++;
 
         if (chunk.size() >= CHUNK_SIZE) {
-            char fname[256];
-            snprintf(fname, sizeof(fname), "/tmp/btc_chunk_%d_%d.tmp", getpid(), chunk_id);
+            const char *tmp_env = getenv("TMPDIR");
+            std::string tdir = (tmp_env && access(tmp_env, W_OK) == 0) ? tmp_env : ((access("/tmp", W_OK) == 0) ? "/tmp" : ".");
+            char fname[512];
+            snprintf(fname, sizeof(fname), "%s/btc_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
 
             if (create_temp_chunk(chunk, chunk_id) != 0) {
                 fin.close();
@@ -279,8 +283,10 @@ static int stage_read_and_sort_external(const char *hex_path, uint64_t *total_un
     }
 
     if (!chunk.empty()) {
-        char fname[256];
-        snprintf(fname, sizeof(fname), "/tmp/btc_chunk_%d_%d.tmp", getpid(), chunk_id);
+        const char *tmp_env = getenv("TMPDIR");
+        std::string tdir = (tmp_env && access(tmp_env, W_OK) == 0) ? tmp_env : ((access("/tmp", W_OK) == 0) ? "/tmp" : ".");
+        char fname[512];
+        snprintf(fname, sizeof(fname), "%s/btc_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
 
         if (create_temp_chunk(chunk, chunk_id) != 0) {
             for (auto &cf : chunk_files) unlink(cf.c_str());
