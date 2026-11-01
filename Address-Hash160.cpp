@@ -17,12 +17,14 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <array>
 #include <string>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <chrono>
+#include <algorithm>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -109,6 +111,8 @@ static bool decode_base58_check(const char *str, size_t len, uint8_t *h160_out) 
         decoded[total_len - 1 - i] = bin[i];
     }
 
+    // Verify 1-byte version prefix is 0x00 (P2PKH) or 0x05 (P2SH)
+    // and verify double-SHA256 checksum
     uint8_t hash1[32], hash2[32];
     sha256(decoded, 21, hash1);
     sha256(hash1, 32, hash2);
@@ -225,7 +229,7 @@ static bool decode_ethereum(const char *str, size_t len, uint8_t *h160_out) {
 }
 
 static bool is_word_delim(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',' || c == ';' || c == ':' || c == '"' || c == '\'' || c == '|';
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',' || c == ';' || c == ':' || c == '"' || c == '\'' || c == '|' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}';
 }
 
 static void bytes_to_hex(const uint8_t *in, size_t len, char *out) {
@@ -236,24 +240,11 @@ static void bytes_to_hex(const uint8_t *in, size_t len, char *out) {
     out[len * 2] = '\0';
 }
 
-static void print_ui(size_t current_file_idx, size_t total_files, const std::string &current_filename,
-                     double file_progress_pct, uint64_t total_converted, double elapsed_sec) {
-    printf("\033[H\033[J");
-    printf("======================================================================\n");
-    printf("                  BTC & ETH Address -> Hash160 Converter              \n");
-    printf("======================================================================\n");
-    printf(" File Progress  : [%zu/%zu] %s\n", current_file_idx, total_files, current_filename.c_str());
-    printf(" Conversion     : %.2f%%\n", file_progress_pct);
-    printf(" Total Hashes   : %lu\n", total_converted);
-    printf(" Elapsed Time   : %.2f s\n", elapsed_sec);
-    printf(" Output Target  : BTC.hex\n");
-    printf("======================================================================\n");
-    fflush(stdout);
-}
+using Hash20 = std::array<uint8_t, 20>;
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <file1> [file2 ...]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <input_file_1> [input_file_2 ... input_file_N]" << std::endl;
         return 1;
     }
 
@@ -262,36 +253,28 @@ int main(int argc, char *argv[]) {
         input_files.push_back(argv[i]);
     }
 
-    FILE *out_fp = fopen("BTC.hex", "a");
-    if (!out_fp) {
-        std::cerr << "Error: Cannot open or create BTC.hex for writing." << std::endl;
-        return 1;
-    }
-
     auto start_time = std::chrono::steady_clock::now();
-
     size_t total_files = input_files.size();
-    uint64_t total_hashes_converted = 0;
+
+    std::vector<Hash20> all_hashes;
+    all_hashes.reserve(100000);
 
     const size_t READ_BUF_SIZE = 1024 * 1024;
     char *read_buf = (char *)malloc(READ_BUF_SIZE);
-
-    const size_t OUT_BUF_SIZE = 1024 * 1024;
-    char *out_buf = (char *)malloc(OUT_BUF_SIZE);
-    size_t out_buf_pos = 0;
-
-    if (!read_buf || !out_buf) {
-        std::cerr << "Error: Memory allocation failed." << std::endl;
-        if (read_buf) free(read_buf);
-        if (out_buf) free(out_buf);
-        fclose(out_fp);
+    if (!read_buf) {
+        std::cerr << "Error: Memory allocation failed for read buffer." << std::endl;
         return 1;
     }
+
+    std::cout << "======================================================================\n";
+    std::cout << "        Universal Address & Hash160 Extractor and Sorter              \n";
+    std::cout << "======================================================================\n";
 
     for (size_t f_idx = 0; f_idx < total_files; f_idx++) {
         const std::string &fname = input_files[f_idx];
         FILE *in_fp = fopen(fname.c_str(), "rb");
         if (!in_fp) {
+            std::cerr << "[WARN] Could not open file: " << fname << std::endl;
             continue;
         }
 
@@ -302,95 +285,16 @@ int main(int argc, char *argv[]) {
         }
 
         uint64_t bytes_processed = 0;
+        uint64_t lines_processed = 0;
+        uint64_t valid_addresses_in_file = 0;
         std::string line_remainder = "";
 
         auto last_ui_update = std::chrono::steady_clock::now();
 
-        while (true) {
-            size_t bytes_read = fread(read_buf, 1, READ_BUF_SIZE, in_fp);
-            if (bytes_read == 0) break;
-            bytes_processed += bytes_read;
+        auto process_line = [&](const std::string &line) {
+            lines_processed++;
+            if (line.empty()) return;
 
-            size_t chunk_start = 0;
-            for (size_t i = 0; i < bytes_read; i++) {
-                if (read_buf[i] == '\n' || read_buf[i] == '\r') {
-                    std::string line = line_remainder;
-                    if (chunk_start < i) {
-                        line.append(read_buf + chunk_start, i - chunk_start);
-                    }
-                    line_remainder.clear();
-                    chunk_start = i + 1;
-
-                    if (!line.empty()) {
-                        size_t l_len = line.length();
-                        size_t start_pos = 0;
-                        while (start_pos < l_len) {
-                            while (start_pos < l_len && is_word_delim(line[start_pos])) {
-                                start_pos++;
-                            }
-                            if (start_pos >= l_len) break;
-
-                            size_t end_pos = start_pos;
-                            while (end_pos < l_len && !is_word_delim(line[end_pos])) {
-                                end_pos++;
-                            }
-
-                            size_t token_len = end_pos - start_pos;
-                            const char *token = line.c_str() + start_pos;
-
-                            uint8_t h160[20];
-                            bool found = false;
-
-                            if (token_len >= 25 && token_len <= 35 && (token[0] == '1' || token[0] == '3')) {
-                                if (decode_base58_check(token, token_len, h160)) {
-                                    found = true;
-                                }
-                            } else if (token_len >= 42 && token_len <= 90 && (token[0] == 'b' || token[0] == 'B') && (token[1] == 'c' || token[1] == 'C')) {
-                                if (decode_bech32(token, token_len, h160)) {
-                                    found = true;
-                                }
-                            } else if ((token_len == 42 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) || token_len == 40) {
-                                if (decode_ethereum(token, token_len, h160)) {
-                                    found = true;
-                                }
-                            }
-
-                            if (found) {
-                                char hex_str[41];
-                                bytes_to_hex(h160, 20, hex_str);
-
-                                if (out_buf_pos + 41 > OUT_BUF_SIZE) {
-                                    fwrite(out_buf, 1, out_buf_pos, out_fp);
-                                    out_buf_pos = 0;
-                                }
-                                memcpy(out_buf + out_buf_pos, hex_str, 40);
-                                out_buf_pos += 40;
-                                out_buf[out_buf_pos++] = '\n';
-                                total_hashes_converted++;
-                            }
-
-                            start_pos = end_pos;
-                        }
-                    }
-                }
-            }
-
-            if (chunk_start < bytes_read) {
-                line_remainder.append(read_buf + chunk_start, bytes_read - chunk_start);
-            }
-
-            auto now = std::chrono::steady_clock::now();
-            double elapsed_ui = std::chrono::duration<double>(now - last_ui_update).count();
-            if (elapsed_ui >= 0.2 || bytes_processed == file_size) {
-                double pct = file_size > 0 ? ((double)bytes_processed / (double)file_size) * 100.0 : 100.0;
-                double total_elapsed = std::chrono::duration<double>(now - start_time).count();
-                print_ui(f_idx + 1, total_files, fname, pct, total_hashes_converted, total_elapsed);
-                last_ui_update = now;
-            }
-        }
-
-        if (!line_remainder.empty()) {
-            std::string line = line_remainder;
             size_t l_len = line.length();
             size_t start_pos = 0;
             while (start_pos < l_len) {
@@ -407,42 +311,138 @@ int main(int argc, char *argv[]) {
                 size_t token_len = end_pos - start_pos;
                 const char *token = line.c_str() + start_pos;
 
-                uint8_t h160[20];
+                Hash20 h;
                 bool found = false;
 
+                // 1. Bitcoin P2PKH / P2SH (Base58Check)
                 if (token_len >= 25 && token_len <= 35 && (token[0] == '1' || token[0] == '3')) {
-                    if (decode_base58_check(token, token_len, h160)) {
+                    if (decode_base58_check(token, token_len, h.data())) {
                         found = true;
                     }
-                } else if (token_len >= 42 && token_len <= 90 && (token[0] == 'b' || token[0] == 'B') && (token[1] == 'c' || token[1] == 'C')) {
-                    if (decode_bech32(token, token_len, h160)) {
+                }
+                // 2. Bitcoin SegWit Bech32/Bech32m (bc1q / bc1p)
+                else if (token_len >= 42 && token_len <= 90 &&
+                         (token[0] == 'b' || token[0] == 'B') &&
+                         (token[1] == 'c' || token[1] == 'C')) {
+                    if (decode_bech32(token, token_len, h.data())) {
                         found = true;
                     }
-                } else if ((token_len == 42 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) || token_len == 40) {
-                    if (decode_ethereum(token, token_len, h160)) {
+                }
+                // 3. Ethereum or Raw Hash160 (0x prefix or raw 40 hex chars)
+                else if ((token_len == 42 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) || token_len == 40) {
+                    if (decode_ethereum(token, token_len, h.data())) {
                         found = true;
                     }
                 }
 
                 if (found) {
-                    char hex_str[41];
-                    bytes_to_hex(h160, 20, hex_str);
-
-                    if (out_buf_pos + 41 > OUT_BUF_SIZE) {
-                        fwrite(out_buf, 1, out_buf_pos, out_fp);
-                        out_buf_pos = 0;
-                    }
-                    memcpy(out_buf + out_buf_pos, hex_str, 40);
-                    out_buf_pos += 40;
-                    out_buf[out_buf_pos++] = '\n';
-                    total_hashes_converted++;
+                    all_hashes.push_back(h);
+                    valid_addresses_in_file++;
                 }
 
                 start_pos = end_pos;
             }
+        };
+
+        while (true) {
+            size_t bytes_read = fread(read_buf, 1, READ_BUF_SIZE, in_fp);
+            if (bytes_read == 0) break;
+            bytes_processed += bytes_read;
+
+            size_t chunk_start = 0;
+            for (size_t i = 0; i < bytes_read; i++) {
+                if (read_buf[i] == '\n' || read_buf[i] == '\r') {
+                    std::string line = line_remainder;
+                    if (chunk_start < i) {
+                        line.append(read_buf + chunk_start, i - chunk_start);
+                    }
+                    line_remainder.clear();
+                    chunk_start = i + 1;
+
+                    process_line(line);
+                }
+            }
+
+            if (chunk_start < bytes_read) {
+                line_remainder.append(read_buf + chunk_start, bytes_read - chunk_start);
+            }
+
+            auto now = std::chrono::steady_clock::now();
+            double elapsed_ui = std::chrono::duration<double>(now - last_ui_update).count();
+            if (elapsed_ui >= 0.25 || bytes_processed == file_size) {
+                double pct = file_size > 0 ? ((double)bytes_processed / (double)file_size) * 100.0 : 100.0;
+                printf("\r[Processing %zu/%zu] %s: %.1f%% | Lines: %lu | Extracted: %lu | Total: %zu",
+                       f_idx + 1, total_files, fname.c_str(), pct,
+                       (unsigned long)lines_processed,
+                       (unsigned long)valid_addresses_in_file,
+                       all_hashes.size());
+                fflush(stdout);
+                last_ui_update = now;
+            }
+        }
+
+        if (!line_remainder.empty()) {
+            process_line(line_remainder);
         }
 
         fclose(in_fp);
+
+        printf("\r[Completed %zu/%zu] %s: 100.0%% | Lines: %lu | Extracted: %lu | Total: %zu\n",
+               f_idx + 1, total_files, fname.c_str(),
+               (unsigned long)lines_processed,
+               (unsigned long)valid_addresses_in_file,
+               all_hashes.size());
+        fflush(stdout);
+    }
+
+    free(read_buf);
+
+    std::cout << "\nSorting and deduplicating " << all_hashes.size() << " extracted hashes..." << std::endl;
+    auto sort_start = std::chrono::steady_clock::now();
+
+    // Strict lexicographical byte-by-byte sort via memcmp
+    std::sort(all_hashes.begin(), all_hashes.end(), [](const Hash20 &a, const Hash20 &b) {
+        return memcmp(a.data(), b.data(), 20) < 0;
+    });
+
+    // Deduplicate via std::unique
+    auto last_it = std::unique(all_hashes.begin(), all_hashes.end(), [](const Hash20 &a, const Hash20 &b) {
+        return memcmp(a.data(), b.data(), 20) == 0;
+    });
+    all_hashes.erase(last_it, all_hashes.end());
+
+    auto sort_end = std::chrono::steady_clock::now();
+    double sort_duration = std::chrono::duration<double>(sort_end - sort_start).count();
+    std::cout << "Sorting and deduplication finished in " << sort_duration << " s. Unique hashes: " << all_hashes.size() << std::endl;
+
+    // Output to BTC.hex as 40 lowercase hexadecimal characters per line
+    std::cout << "Writing unique hashes to BTC.hex..." << std::endl;
+    FILE *out_fp = fopen("BTC.hex", "wb");
+    if (!out_fp) {
+        std::cerr << "Error: Cannot open or create BTC.hex for writing." << std::endl;
+        return 1;
+    }
+
+    const size_t OUT_BUF_SIZE = 1024 * 1024;
+    char *out_buf = (char *)malloc(OUT_BUF_SIZE);
+    if (!out_buf) {
+        std::cerr << "Error: Memory allocation failed for output buffer." << std::endl;
+        fclose(out_fp);
+        return 1;
+    }
+    size_t out_buf_pos = 0;
+
+    for (const auto &h : all_hashes) {
+        char hex_str[41];
+        bytes_to_hex(h.data(), 20, hex_str);
+
+        if (out_buf_pos + 41 > OUT_BUF_SIZE) {
+            fwrite(out_buf, 1, out_buf_pos, out_fp);
+            out_buf_pos = 0;
+        }
+        memcpy(out_buf + out_buf_pos, hex_str, 40);
+        out_buf_pos += 40;
+        out_buf[out_buf_pos++] = '\n';
     }
 
     if (out_buf_pos > 0) {
@@ -452,8 +452,6 @@ int main(int argc, char *argv[]) {
 
     fflush(out_fp);
     fclose(out_fp);
-
-    free(read_buf);
     free(out_buf);
 
     auto end_time = std::chrono::steady_clock::now();
@@ -468,16 +466,15 @@ int main(int argc, char *argv[]) {
     double size_mb = (double)btc_hex_size / (1024.0 * 1024.0);
     double size_gb = (double)btc_hex_size / (1024.0 * 1024.0 * 1024.0);
 
-    printf("\033[H\033[J");
-    printf("======================================================================\n");
-    printf("                 CONVERSION COMPLETE - SUMMARY                        \n");
-    printf("======================================================================\n");
-    printf(" Total Files Processed : %zu\n", total_files);
-    printf(" Total Hashes Written  : %lu\n", total_hashes_converted);
-    printf(" BTC.hex File Size     : %.2f MB (%.4f GB)\n", size_mb, size_gb);
-    printf(" Total Execution Time  : %.2f s\n", total_duration);
-    printf(" Output Saved To       : BTC.hex\n");
-    printf("======================================================================\n");
+    std::cout << "\n======================================================================\n";
+    std::cout << "                 CONVERSION COMPLETE - SUMMARY                        \n";
+    std::cout << "======================================================================\n";
+    std::cout << " Total Files Processed : " << total_files << "\n";
+    std::cout << " Total Unique Hashes   : " << all_hashes.size() << "\n";
+    printf(" BTC.hex File Size     : %.2f MB (%.6f GB)\n", size_mb, size_gb);
+    printf(" Total Execution Time  : %.2f s (%.2f min)\n", total_duration, total_duration / 60.0);
+    std::cout << " Output Saved To       : BTC.hex\n";
+    std::cout << "======================================================================\n";
 
     return 0;
 }

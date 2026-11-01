@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
 
@@ -56,12 +58,6 @@
 #include "Secp256k1/util.h"
 #include "Secp256k1/Random.h"
 
-enum IdxFormat {
-    IDX_UNKNOWN = 0,
-    IDX_FULL = 1,
-    IDX_SPARSE = 2
-};
-
 struct FoundLogEntry {
     std::string message;
     int remaining_cycles;
@@ -82,30 +78,28 @@ static std::unique_ptr<std::atomic<unsigned long long>[]> g_thread_counters;
 static Secp256K1 *g_secp = nullptr;
 static idx_table_t g_idx;
 static xor_table_t g_xorf;
-static FILE *g_bin_file = nullptr;
+static int g_bin_fd = -1;
 static uint8_t *g_bin_map = nullptr;
 static size_t g_bin_size = 0;
 static int g_mem_mode_bin = 1;
 static int g_mem_mode_idx = 1;
 static int g_mem_mode_xor = 1;
-static IdxFormat g_idx_format = IDX_UNKNOWN;
 
 static int g_range_bits = 71;
 static bool g_random_mode = false;
 static int g_num_threads = 0;
 static int g_cpu_cores = 1;
 static int g_big_cores = 0;
-static bool g_all_ranges = false;
 
 static uint8_t g_start_key[32];
 static uint8_t g_end_key[32];
-static Point g_inc_point;
 
 static const char *ORDER_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
 static const char *BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const char *BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
-static const int BATCH_SIZE = 256;
+// Batch size 512 keys for high performance Montgomery batch inversion
+static const int BATCH_SIZE = 512;
 static const int BATCH_STEPS = BATCH_SIZE - 1;
 
 static void sig_handler(int) {
@@ -113,13 +107,13 @@ static void sig_handler(int) {
 }
 
 static void print_usage(const char *prog_name) {
-    printf("BTCMobile Engine Usage:\n");
-    printf("  %s -R [1-256] [-S|-Random] [-t threads]\n\n", prog_name);
-    printf("Options:\n");
-    printf("  -R <bits|all>   Range in bits (1-256) or 'all' for full scan\n");
-    printf("  -S              Sequential search mode (default)\n");
-    printf("  -Random         Random bidirectional position jump mode\n");
-    printf("  -t <threads>    Number of worker threads (capped to Big cores)\n");
+    printf("Usage:\n");
+    printf("  %s -R <range_num> [-S | -Random] [-t <threads>]\n\n", prog_name);
+    printf("Parameters:\n");
+    printf("  -R <1-256>   Select range bit bounds ([2^(R-1), 2^R - 1])\n");
+    printf("  -S           Sequential forward search from range start to end\n");
+    printf("  -Random      Bidirectional random search sweeping anchor points\n");
+    printf("  -t <threads> Thread count (up to 32, bound to Big/Prime cores)\n");
 }
 
 static int hex_val(char c) {
@@ -155,7 +149,7 @@ static void set_order_value(uint8_t *a) {
 static void initialize_range(int bits) {
     if (bits <= 0) bits = 1;
     if (bits > 256) bits = 256;
-    
+
     if (bits == 256) {
         set_power_of_two(g_start_key, 255);
         set_order_value(g_end_key);
@@ -347,7 +341,7 @@ static void generate_eth_address(const uint8_t *pub_uncompressed_xy, char *out, 
     KECCAK_256_Init(&ctx);
     KECCAK_256_Update(&ctx, pub_uncompressed_xy, 64);
     KECCAK_256_Final(hash, &ctx);
-    
+
     if (outsize < 43) { out[0] = 0; return; }
     size_t pos = 0;
     out[pos++] = '0';
@@ -366,75 +360,85 @@ static void bytes_to_int_obj(const uint8_t *bytes, Int &obj) {
 }
 
 static int ask_storage_choice(const char *filename) {
-    printf("[INFO] Select storage for %s : [1] RAM  [2] Disk MMAP\n", filename);
+    printf("[INFO] Select storage for %s : [1] RAM [2] Disk MMAP\n", filename);
     printf("Choice [1-2]: ");
+    fflush(stdout);
     int choice = 0;
     if (scanf("%d", &choice) != 1) choice = 1;
     if (choice < 1 || choice > 2) choice = 1;
     return choice;
 }
 
-static void init_memory_loading() {
+static void init_storage_selection() {
     g_mem_mode_bin = ask_storage_choice(BIN_FILE);
     g_mem_mode_idx = ask_storage_choice(IDX_FILE);
     g_mem_mode_xor = ask_storage_choice(XOR_FILE);
-    
-    printf("\n[INFO] Storage modes selected:\n");
-    printf("[INFO] BTC.bin : %s\n", g_mem_mode_bin == 1 ? "RAM" : "MMAP");
-    printf("[INFO] BTC.idx : %s\n", g_mem_mode_idx == 1 ? "RAM" : "MMAP");
-    printf("[INFO] BTC.xor : %s\n", g_mem_mode_xor == 1 ? "RAM" : "MMAP");
+
+    printf("\n[INFO] Storage configurations:\n");
+    printf("[INFO] %s : %s\n", BIN_FILE, g_mem_mode_bin == 1 ? "RAM" : "Disk MMAP");
+    printf("[INFO] %s : %s\n", IDX_FILE, g_mem_mode_idx == 1 ? "RAM" : "Disk MMAP");
+    printf("[INFO] %s : %s\n\n", XOR_FILE, g_mem_mode_xor == 1 ? "RAM" : "Disk MMAP");
 }
 
 static int load_database_files() {
+    // 1. Load IDX
     struct stat st;
     if (stat(IDX_FILE, &st) != 0) {
         fprintf(stderr, "[ERROR] Cannot find %s\n", IDX_FILE);
         return -1;
     }
-    
+
     size_t size_idx = st.st_size;
-    bool div_28 = (size_idx % 28 == 0);
-    bool div_24 = (size_idx % 24 == 0);
-    
-    if (div_28 && !div_24) {
-        g_idx_format = IDX_FULL;
-    } else if (div_24 && !div_28) {
-        g_idx_format = IDX_SPARSE;
-    } else if (div_28 && div_24) {
-        g_idx_format = IDX_FULL;
-        fprintf(stderr, "[WARN] Formato ambiguo, asumiendo FULL\n");
-    } else {
-        fprintf(stderr, "[ERROR] BTC.idx tiene tamaño inválido: %zu\n", size_idx);
+    if (size_idx < sizeof(idx_header_t) && size_idx % 28 != 0 && size_idx % 24 != 0) {
+        fprintf(stderr, "[ERROR] %s has invalid file size: %zu\n", IDX_FILE, size_idx);
         return -1;
     }
 
     if (g_mem_mode_idx == 1) {
-        if (size_idx > 2147483648ULL) {
-            fprintf(stderr, "[WARN] BTC.idx es grande (%zu bytes). Se recomienda usar MMAP.\n", size_idx);
-        }
         if (btc_load_idx(IDX_FILE, &g_idx) != 0) {
-             fprintf(stderr, "[WARN] Cannot load %s into RAM. Falling back to MMAP...\n", IDX_FILE);
-             g_mem_mode_idx = 2;
+            fprintf(stderr, "[WARN] Cannot load %s into RAM. Falling back to MMAP...\n", IDX_FILE);
+            g_mem_mode_idx = 2;
         }
     }
 
     if (g_mem_mode_idx == 2) {
         int fd = open(IDX_FILE, O_RDONLY);
         if (fd < 0) {
-             fprintf(stderr, "[ERROR] Cannot open %s for mmap\n", IDX_FILE);
-             return -1;
+            fprintf(stderr, "[ERROR] Cannot open %s for mmap\n", IDX_FILE);
+            return -1;
         }
-        g_idx.records = (idx_record_t*)mmap(NULL, size_idx, PROT_READ, MAP_PRIVATE, fd, 0);
+        void *map_ptr = mmap(NULL, size_idx, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
-        if (g_idx.records == MAP_FAILED) {
-             fprintf(stderr, "[ERROR] mmap failed for IDX\n");
-             return -1;
+        if (map_ptr == MAP_FAILED) {
+            fprintf(stderr, "[ERROR] mmap failed for %s\n", IDX_FILE);
+            return -1;
         }
-        g_idx.count = size_idx / (g_idx_format == IDX_FULL ? 28 : 24);
+
+        idx_header_t *hdr = (idx_header_t*)map_ptr;
+        if (size_idx >= sizeof(idx_header_t) && hdr->magic == IDX_MAGIC) {
+            g_idx.records = (uint8_t*)map_ptr + sizeof(idx_header_t);
+            g_idx.count = hdr->record_count;
+            g_idx.format_type = hdr->format_type;
+            g_idx.stride = hdr->stride ? hdr->stride : (hdr->format_type == IDX_FORMAT_SPARSE ? IDX_SPARSE_STRIDE : 1);
+            g_idx.has_header = true;
+        } else {
+            g_idx.records = map_ptr;
+            if (size_idx % 28 == 0) {
+                g_idx.count = size_idx / 28;
+                g_idx.format_type = IDX_FORMAT_FULL;
+                g_idx.stride = 1;
+            } else {
+                g_idx.count = size_idx / 24;
+                g_idx.format_type = IDX_FORMAT_SPARSE;
+                g_idx.stride = IDX_SPARSE_STRIDE;
+            }
+            g_idx.has_header = false;
+        }
         g_idx.is_mmap = true;
         g_idx.mmap_size = size_idx;
     }
 
+    // 2. Load XOR
     if (g_mem_mode_xor == 1) {
         if (btc_load_xor(XOR_FILE, &g_xorf) != 0) {
             fprintf(stderr, "[WARN] Cannot load %s into RAM. Falling back to MMAP...\n", XOR_FILE);
@@ -451,9 +455,9 @@ static int load_database_files() {
         }
         int fd = open(XOR_FILE, O_RDONLY);
         if (fd < 0) {
-             fprintf(stderr, "[ERROR] Cannot open %s for mmap\n", XOR_FILE);
-             btc_free_idx(&g_idx);
-             return -1;
+            fprintf(stderr, "[ERROR] Cannot open %s for mmap\n", XOR_FILE);
+            btc_free_idx(&g_idx);
+            return -1;
         }
         xor_header_t hdr;
         if (read(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
@@ -462,18 +466,18 @@ static int load_database_files() {
             btc_free_idx(&g_idx);
             return -1;
         }
-        
+
         uint64_t fp_bytes = hdr.array_length;
         size_t total_size = sizeof(xor_header_t) + fp_bytes;
-        
+
         uint8_t *full_map = (uint8_t*)mmap(NULL, total_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
         if (full_map == MAP_FAILED) {
-             fprintf(stderr, "[ERROR] mmap failed for XOR\n");
-             btc_free_idx(&g_idx);
-             return -1;
+            fprintf(stderr, "[ERROR] mmap failed for %s\n", XOR_FILE);
+            btc_free_idx(&g_idx);
+            return -1;
         }
-        
+
         g_xorf.fingerprints = full_map + sizeof(xor_header_t);
         g_xorf.seed = hdr.seed;
         g_xorf.block_length = hdr.block_length;
@@ -484,229 +488,80 @@ static int load_database_files() {
         g_xorf.mmap_size = total_size;
     }
 
-    if (g_mem_mode_bin == 1) {
-        g_bin_file = fopen(BIN_FILE, "rb");
-        if (!g_bin_file) {
-            fprintf(stderr, "[ERROR] Cannot open %s\n", BIN_FILE);
-            btc_free_xor(&g_xorf);
-            btc_free_idx(&g_idx);
-            return -1;
-        }
-        
-        fseek(g_bin_file, 0, SEEK_END);
-        g_bin_size = ftell(g_bin_file);
-        fseek(g_bin_file, 0, SEEK_SET);
-    } else {
-        int fd = open(BIN_FILE, O_RDONLY);
-        if (fd < 0) {
-             fprintf(stderr, "[ERROR] Cannot open %s for mmap\n", BIN_FILE);
-             btc_free_xor(&g_xorf);
-             btc_free_idx(&g_idx);
-             return -1;
-        }
-        struct stat bst;
-        fstat(fd, &bst);
-        g_bin_size = bst.st_size;
-        g_bin_map = (uint8_t*)mmap(NULL, g_bin_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (g_bin_map == MAP_FAILED) {
-             fprintf(stderr, "[ERROR] mmap failed for BIN\n");
-             btc_free_xor(&g_xorf);
-             btc_free_idx(&g_idx);
-             return -1;
-        }
-    }
-    
-    if (g_idx.count == 0) {
-         fprintf(stderr, "[ERROR] Empty index\n");
-         return -1;
-    }
-    
-    uint8_t test_hash[HASH160_LEN];
-    uint64_t test_rec_idx = 0;
-    
-    if (g_idx_format == IDX_FULL) {
-        memcpy(test_hash, g_idx.records[0].hash, HASH160_LEN);
-        test_rec_idx = g_idx.records[0].record_index;
-    } else {
-        idx_record_sparse_t *sparse_recs = (idx_record_sparse_t*)g_idx.records;
-        memcpy(test_hash, sparse_recs[0].hash, HASH160_LEN);
-        test_rec_idx = sparse_recs[0].record_index;
-    }
-    
-    uint8_t stored_hash[HASH160_LEN];
-    bool confirmed = false;
-    
-    if (g_mem_mode_bin == 2) {
-        if (test_rec_idx * HASH160_LEN < g_bin_size) {
-            memcpy(stored_hash, g_bin_map + (test_rec_idx * HASH160_LEN), HASH160_LEN);
-            confirmed = (memcmp(stored_hash, test_hash, HASH160_LEN) == 0);
-        }
-    } else {
-        std::lock_guard<std::mutex> lock(g_io_mutex);
-        fseek(g_bin_file, test_rec_idx * HASH160_LEN, SEEK_SET);
-        if (fread(stored_hash, 1, HASH160_LEN, g_bin_file) == HASH160_LEN) {
-            confirmed = (memcmp(stored_hash, test_hash, HASH160_LEN) == 0);
-        }
-    }
-    
-    if (!confirmed) {
-        char hex_test[41], hex_stored[41];
-        for(int i=0;i<20;i++) sprintf(hex_test+i*2,"%02x",test_hash[i]);
-        for(int i=0;i<20;i++) sprintf(hex_stored+i*2,"%02x",stored_hash[i]);
-        fprintf(stderr, "[ERROR] Self-test fallido: BTC.idx[0] no está en BTC.bin[%llu]\n", test_rec_idx);
-        fprintf(stderr, "Expected: %s\nFound:    %s\n", hex_test, hex_stored);
+    // 3. Load BIN
+    g_bin_fd = open(BIN_FILE, O_RDONLY);
+    if (g_bin_fd < 0) {
+        fprintf(stderr, "[ERROR] Cannot open %s\n", BIN_FILE);
+        btc_free_xor(&g_xorf);
+        btc_free_idx(&g_idx);
         return -1;
     }
-    
-    fprintf(stderr, "[INFO] Formato %s verificado: %llu entradas, %zu bytes bin\n", 
-            g_idx_format == IDX_FULL ? "FULL" : "SPARSE", 
-            g_idx.count, g_bin_size);
-            
-    return 0;
-}
 
-static void build_increment_points() {
-    Int k_inc((uint64_t)g_num_threads);
-    g_inc_point = g_secp->ComputePublicKey(&k_inc);
-}
+    struct stat bst;
+    fstat(g_bin_fd, &bst);
+    g_bin_size = bst.st_size;
 
-static void run_diagnostic_k1() {
-    fprintf(stderr, "[DIAG] Testing privkey 1:\n");
-    
-    uint8_t priv_bytes[32];
-    zero_256(priv_bytes);
-    priv_bytes[31] = 1;
-    
-    Int k_int;
-    bytes_to_int_obj(priv_bytes, k_int);
-    
-    Point pub = g_secp->ComputePublicKey(&k_int);
-    
-    uint8_t h160_comp[20];
-    uint8_t h160_unc[20];
-    
-    g_secp->GetHash160(P2PKH, true, pub, h160_comp);
-    g_secp->GetHash160(P2PKH, false, pub, h160_unc);
-    
-    char hex_comp[41];
-    char hex_unc[41];
-    for(int i=0;i<20;i++) sprintf(hex_comp+i*2,"%02x",h160_comp[i]);
-    for(int i=0;i<20;i++) sprintf(hex_unc+i*2,"%02x",h160_unc[i]);
-    hex_comp[40]=0;
-    hex_unc[40]=0;
-    
-    fprintf(stderr, "[DIAG]   hash160 compressed  : %s\n", hex_comp);
-    fprintf(stderr, "[DIAG]   hash160 uncompressed: %s\n", hex_unc);
-    fprintf(stderr, "[DIAG]   expected compressed : 751e76e8199196d454941c45d1b3a323f1433bd6\n");
-    fprintf(stderr, "[DIAG]   expected uncompressed: 91b24bf9f5288532960ac687abb035127b1d28a5\n");
-    
-    bool match_comp = (strcmp(hex_comp, "751e76e8199196d454941c45d1b3a323f1433bd6") == 0);
-    bool match_unc = (strcmp(hex_unc, "91b24bf9f5288532960ac687abb035127b1d28a5") == 0);
-    
-    fprintf(stderr, "[DIAG]   match compressed    : %s\n", match_comp ? "yes" : "no");
-    fprintf(stderr, "[DIAG]   match uncompressed  : %s\n", match_unc ? "yes" : "no");
-    
-    if (!match_comp && !match_unc) {
-        fprintf(stderr, "[FATAL] BTC.cpp hash160 incorrecto para privkey 1. Abortando.\n");
-        exit(1);
+    if (g_mem_mode_bin == 1) {
+        // Full in-memory buffer
+        g_bin_map = (uint8_t*)malloc(g_bin_size > 0 ? g_bin_size : 1);
+        if (g_bin_map) {
+            if ((uint64_t)read(g_bin_fd, g_bin_map, g_bin_size) != g_bin_size) {
+                free(g_bin_map);
+                g_bin_map = nullptr;
+                fprintf(stderr, "[WARN] Failed reading %s into RAM, falling back to pread64\n", BIN_FILE);
+            }
+        } else {
+            fprintf(stderr, "[WARN] Failed allocating RAM for %s, falling back to pread64\n", BIN_FILE);
+        }
+    } else {
+        // Disk MMAP
+        g_bin_map = (uint8_t*)mmap(NULL, g_bin_size, PROT_READ, MAP_PRIVATE, g_bin_fd, 0);
+        if (g_bin_map == MAP_FAILED) {
+            fprintf(stderr, "[WARN] mmap failed for %s, falling back to pread64\n", BIN_FILE);
+            g_bin_map = nullptr;
+        }
     }
-    
-    bool xor_comp = btc_xor_contains(&g_xorf, h160_comp, HASH160_LEN);
-    bool xor_unc = btc_xor_contains(&g_xorf, h160_unc, HASH160_LEN);
-    
-    fprintf(stderr, "[DIAG]   xor_contains(comp)  : %s\n", xor_comp ? "yes" : "no");
-    fprintf(stderr, "[DIAG]   xor_contains(uncomp): %s\n", xor_unc ? "yes" : "no");
-    
-    uint64_t rec_idx = 0;
-    int idx_comp = btc_binary_search_idx(&g_idx, h160_comp, &rec_idx);
-    fprintf(stderr, "[DIAG]   idx_lookup(comp)    : %s=%llu / not_found\n", idx_comp==0?"found":"not_found", rec_idx);
-    
-    idx_comp = btc_binary_search_idx(&g_idx, h160_unc, &rec_idx);
-    fprintf(stderr, "[DIAG]   idx_lookup(uncomp)  : %s=%llu / not_found\n", idx_comp==0?"found":"not_found", rec_idx);
-}
 
-static void process_hit(const uint8_t priv_bytes[32], Point &current_pub, const uint8_t h160_comp[20], const uint8_t h160_unc[20], int thread_id) {
-    char ts[64];
-    utc_timestamp(ts, sizeof(ts));
-    
-    std::lock_guard<std::mutex> lock(g_found_mutex);
-    g_found_count.fetch_add(1, std::memory_order_relaxed);
-    
-    char priv_hex[65];
-    for(int i=0;i<32;i++) sprintf(priv_hex+i*2,"%02x",priv_bytes[i]);
-    priv_hex[64]=0;
-    
-    char h160_comp_hex[41];
-    for(int i=0;i<20;i++) sprintf(h160_comp_hex+i*2,"%02x",h160_comp[i]);
-    h160_comp_hex[40]=0;
-    
-    char h160_unc_hex[41];
-    for(int i=0;i<20;i++) sprintf(h160_unc_hex+i*2,"%02x",h160_unc[i]);
-    h160_unc_hex[40]=0;
+    if (g_idx.count == 0) {
+        fprintf(stderr, "[ERROR] Empty index table\n");
+        return -1;
+    }
 
-    char addr_c[64], addr_u[64], addr_sh[64], addr_be[128], addr_eth[64];
-    generate_base58_check(h160_comp, 0x00, addr_c, sizeof(addr_c));
-    generate_base58_check(h160_unc, 0x00, addr_u, sizeof(addr_u));
-    
-    uint8_t redeem[22];
-    redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2,h160_comp,20);
-    uint8_t sh32[32], sh20[20];
-    sha256(redeem, 22, sh32);
-    ripemd160(sh32, 32, sh20);
-    generate_base58_check(sh20, 0x05, addr_sh, sizeof(addr_sh));
-    
-    generate_bech32_p2wpkh(h160_comp, addr_be, sizeof(addr_be));
-    
-    unsigned char raw_pub[65];
-    g_secp->GetPublicKeyRaw(false, current_pub, (char*)raw_pub);
-    generate_eth_address(raw_pub+1, addr_eth, sizeof(addr_eth));
-
-    std::ostringstream oss;
-    oss << "-|<.>" << std::string(75,'.') << "\n";
-    oss << "-|<.>.FOUND KEY >\n";
-    oss << "-|<.>" << std::string(75,'.') << "\n";
-    oss << "-|<.>.Private Key : " << priv_hex << " >\n";
-    oss << "-|<.>.Hash160 Comp : " << h160_comp_hex << " >\n";
-    oss << "-|<.>.Hash160 Uncomp : " << h160_unc_hex << " >\n";
-    oss << "-|<.>.BTC P2PKH Comp : " << addr_c << " >\n";
-    oss << "-|<.>.BTC P2PKH Uncomp : " << addr_u << " >\n";
-    oss << "-|<.>.BTC P2SH-P2WPKH : " << addr_sh << " >\n";
-    oss << "-|<.>.BTC Bech32 P2WPKH : " << addr_be << " >\n";
-    oss << "-|<.>.ETH Address : " << addr_eth << " >\n";
-    oss << "-|<.>.Range : " << g_range_bits << "/256 >\n";
-    oss << "-|<.>.Subrange : " << thread_id << " >\n";
-    oss << "-|<.>.Timestamp : " << ts << " >\n";
-    oss << "-|<.>" << std::string(75,'.') << "\n";
-    
-    FoundLogEntry entry;
-    entry.message = oss.str();
-    entry.remaining_cycles = 3;
-    g_found_logs.push_back(entry);
-
-    btc_write_found(priv_hex, h160_comp_hex, g_range_bits, thread_id, ts);
+    return 0;
 }
 
 static bool check_and_verify(const uint8_t h160[20], uint64_t *rec_idx_out) {
     if (!btc_xor_contains(&g_xorf, h160, HASH160_LEN)) {
         return false;
     }
-    
+
     g_xor_hits.fetch_add(1, std::memory_order_relaxed);
-    
+
     uint64_t record_index = 0;
     int found_in_idx = 0;
 
-    if (g_idx_format == IDX_FULL) {
-       if (btc_binary_search_idx(&g_idx, h160, &record_index) == 0) {
-        found_in_idx = 1;
-       }
+    if (g_idx.format_type == IDX_FORMAT_FULL) {
+        if (btc_binary_search_idx(&g_idx, h160, &record_index) == 0) {
+            // Confirm in BTC.bin
+            if (g_bin_map) {
+                if (record_index * HASH160_LEN + HASH160_LEN <= g_bin_size) {
+                    if (memcmp(g_bin_map + (record_index * HASH160_LEN), h160, HASH160_LEN) == 0) {
+                        found_in_idx = 1;
+                    }
+                }
+            } else {
+                if (btc_confirm_bin(g_bin_fd, record_index, h160) == 0) {
+                    found_in_idx = 1;
+                }
+            }
+        }
     } else {
-        idx_record_sparse_t *sparse_recs = (idx_record_sparse_t*)g_idx.records;
+        // Sparse index
+        const idx_record_sparse_t *sparse_recs = (const idx_record_sparse_t*)g_idx.records;
         uint64_t low = 0;
         uint64_t high = g_idx.count;
         uint64_t best_block = UINT64_MAX;
-        
+
         while (low < high) {
             uint64_t mid = low + (high - low) / 2;
             int cmp = memcmp(sparse_recs[mid].hash, h160, HASH160_LEN);
@@ -717,31 +572,30 @@ static bool check_and_verify(const uint8_t h160[20], uint64_t *rec_idx_out) {
                 high = mid;
             }
         }
-        
+
         if (best_block != UINT64_MAX) {
             uint32_t start_rec = sparse_recs[best_block].record_index;
-            uint32_t end_rec = start_rec + IDX_SPARSE_STRIDE;
-            if (end_rec > (uint32_t)(g_bin_size / HASH160_LEN)) {
-                end_rec = (uint32_t)(g_bin_size / HASH160_LEN);
+            uint32_t end_rec = start_rec + (g_idx.stride ? g_idx.stride : IDX_SPARSE_STRIDE);
+            uint64_t total_hashes = g_bin_size / HASH160_LEN;
+            if (end_rec > total_hashes) {
+                end_rec = (uint32_t)total_hashes;
             }
-            
+
             for (uint32_t r = start_rec; r < end_rec; r++) {
                 uint8_t stored_hash[HASH160_LEN];
                 bool match = false;
-                
-                if (g_mem_mode_bin == 2) {
-                     if (r * HASH160_LEN < g_bin_size) {
-                         memcpy(stored_hash, g_bin_map + (r * HASH160_LEN), HASH160_LEN);
-                         match = (memcmp(stored_hash, h160, HASH160_LEN) == 0);
-                     }
+
+                if (g_bin_map) {
+                    if (r * HASH160_LEN + HASH160_LEN <= g_bin_size) {
+                        match = (memcmp(g_bin_map + (r * HASH160_LEN), h160, HASH160_LEN) == 0);
+                    }
                 } else {
-                     std::lock_guard<std::mutex> lock(g_io_mutex);
-                     fseek(g_bin_file, r * HASH160_LEN, SEEK_SET);
-                     if (fread(stored_hash, 1, HASH160_LEN, g_bin_file) == HASH160_LEN) {
-                         match = (memcmp(stored_hash, h160, HASH160_LEN) == 0);
-                     }
+                    off64_t offset = (off64_t)r * (off64_t)HASH160_LEN;
+                    if (pread64(g_bin_fd, stored_hash, HASH160_LEN, offset) == HASH160_LEN) {
+                        match = (memcmp(stored_hash, h160, HASH160_LEN) == 0);
+                    }
                 }
-                
+
                 if (match) {
                     record_index = r;
                     found_in_idx = 1;
@@ -750,19 +604,118 @@ static bool check_and_verify(const uint8_t h160[20], uint64_t *rec_idx_out) {
             }
         }
     }
-    
+
     if (found_in_idx > 0) {
         *rec_idx_out = record_index;
         return true;
     }
-    
+
     return false;
 }
 
+static void log_found_match(const std::string &msg) {
+    std::lock_guard<std::mutex> lock(g_found_mutex);
+    g_found_count.fetch_add(1, std::memory_order_relaxed);
+
+    FoundLogEntry entry;
+    entry.message = msg;
+    entry.remaining_cycles = 4;
+    g_found_logs.push_back(entry);
+
+    // Print immediately to console
+    printf("\n%s\n", msg.c_str());
+    fflush(stdout);
+}
+
+static void process_ethereum_match(const uint8_t priv_bytes[32], const Point &pub, const uint8_t eth_hash[20], int thread_id) {
+    char ts[64];
+    utc_timestamp(ts, sizeof(ts));
+
+    char priv_hex[65];
+    for (int i = 0; i < 32; i++) sprintf(priv_hex + i * 2, "%02x", priv_bytes[i]);
+    priv_hex[64] = 0;
+
+    char eth_addr[64];
+    sprintf(eth_addr, "0x");
+    for (int i = 0; i < 20; i++) sprintf(eth_addr + 2 + i * 2, "%02x", eth_hash[i]);
+    eth_addr[42] = 0;
+
+    char eth_hash_hex[41];
+    for (int i = 0; i < 20; i++) sprintf(eth_hash_hex + i * 2, "%02x", eth_hash[i]);
+    eth_hash_hex[40] = 0;
+
+    std::ostringstream oss;
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+    oss << "-|<.>.FOUND ETHEREUM KEY >\n";
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+    oss << "-|<.>.Private Key : " << priv_hex << " >\n";
+    oss << "-|<.>.ETH Address : " << eth_addr << " >\n";
+    oss << "-|<.>.Range       : " << g_range_bits << "/256 >\n";
+    oss << "-|<.>.Thread      : " << thread_id << " >\n";
+    oss << "-|<.>.Timestamp   : " << ts << " >\n";
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+
+    log_found_match(oss.str());
+    btc_write_found(priv_hex, eth_hash_hex, g_range_bits, thread_id, ts);
+}
+
+static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, const uint8_t h160_matched[20], int thread_id) {
+    char ts[64];
+    utc_timestamp(ts, sizeof(ts));
+
+    char priv_hex[65];
+    for (int i = 0; i < 32; i++) sprintf(priv_hex + i * 2, "%02x", priv_bytes[i]);
+    priv_hex[64] = 0;
+
+    uint8_t h160_comp[20];
+    uint8_t h160_unc[20];
+    g_secp->GetHash160(P2PKH, true, pub, h160_comp);
+    g_secp->GetHash160(P2PKH, false, pub, h160_unc);
+
+    char h160_comp_hex[41], h160_unc_hex[41];
+    for (int i = 0; i < 20; i++) sprintf(h160_comp_hex + i * 2, "%02x", h160_comp[i]);
+    for (int i = 0; i < 20; i++) sprintf(h160_unc_hex + i * 2, "%02x", h160_unc[i]);
+    h160_comp_hex[40] = 0;
+    h160_unc_hex[40] = 0;
+
+    char addr_c[64], addr_u[64], addr_sh[64], addr_be[128];
+    generate_base58_check(h160_comp, 0x00, addr_c, sizeof(addr_c));
+    generate_base58_check(h160_unc, 0x00, addr_u, sizeof(addr_u));
+
+    uint8_t redeem[22];
+    redeem[0] = 0x00; redeem[1] = 0x14; memcpy(redeem + 2, h160_comp, 20);
+    uint8_t sh32[32], sh20[20];
+    sha256(redeem, 22, sh32);
+    ripemd160(sh32, 32, sh20);
+    generate_base58_check(sh20, 0x05, addr_sh, sizeof(addr_sh));
+
+    generate_bech32_p2wpkh(h160_comp, addr_be, sizeof(addr_be));
+
+    std::ostringstream oss;
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+    oss << "-|<.>.FOUND BITCOIN KEY >\n";
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+    oss << "-|<.>.Private Key        : " << priv_hex << " >\n";
+    oss << "-|<.>.BTC P2PKH Comp     : " << addr_c << " >\n";
+    oss << "-|<.>.BTC P2PKH Uncomp   : " << addr_u << " >\n";
+    oss << "-|<.>.BTC P2SH-P2WPKH    : " << addr_sh << " >\n";
+    oss << "-|<.>.BTC Bech32 P2WPKH  : " << addr_be << " >\n";
+    oss << "-|<.>.Range              : " << g_range_bits << "/256 >\n";
+    oss << "-|<.>.Thread             : " << thread_id << " >\n";
+    oss << "-|<.>.Timestamp          : " << ts << " >\n";
+    oss << "-|<.>" << std::string(75, '.') << "\n";
+
+    char matched_hex[41];
+    for (int i = 0; i < 20; i++) sprintf(matched_hex + i * 2, "%02x", h160_matched[i]);
+    matched_hex[40] = 0;
+
+    log_found_match(oss.str());
+    btc_write_found(priv_hex, matched_hex, g_range_bits, thread_id, ts);
+}
+
 /*
- * High-performance Montgomery Batch Inversion function for Secp256k1 curves.
- * Computes 256 affine points from a base point and precalculated step table
- * using IntGroup::ModInv(), ModMulK1, and ModSquareK1 reductions.
+ * Montgomery Batch Inversion Affine Addition
+ * Computes BATCH_SIZE affine points from base point using 1 modular inversion.
  */
 static inline void compute_batch_points(
     Point base_pub,
@@ -807,28 +760,64 @@ static inline void compute_batch_points(
     }
 }
 
-static void worker_function(int thread_id) {
-    if (g_big_cores > 0) {
-        btc_pin_thread(thread_id % g_big_cores);
-    } else if (g_cpu_cores > 0) {
-        btc_pin_thread(thread_id % g_cpu_cores);
+static inline void verify_dual_pipeline(
+    const uint8_t cur_priv[32],
+    Point &pt,
+    int thread_id
+) {
+    // Step 1: Ethereum (Keccak-256 over uncompressed coordinates X, Y -> 64 bytes)
+    unsigned char raw_pub[65];
+    g_secp->GetPublicKeyRaw(false, pt, (char*)raw_pub);
+
+    SHA3_256_CTX keccak_ctx;
+    uint8_t keccak_hash[32];
+    KECCAK_256_Init(&keccak_ctx);
+    KECCAK_256_Update(&keccak_ctx, raw_pub + 1, 64);
+    KECCAK_256_Final(keccak_hash, &keccak_ctx);
+
+    uint8_t eth_hash[20];
+    memcpy(eth_hash, keccak_hash + 12, 20);
+
+    uint64_t rec_idx = 0;
+    if (check_and_verify(eth_hash, &rec_idx)) {
+        process_ethereum_match(cur_priv, pt, eth_hash, thread_id);
     }
+
+    // Step 2: Bitcoin (Compressed and Uncompressed Hash160)
+    uint8_t h160_comp[20];
+    uint8_t h160_unc[20];
+    g_secp->GetHash160(P2PKH, true, pt, h160_comp);
+    g_secp->GetHash160(P2PKH, false, pt, h160_unc);
+
+    if (check_and_verify(h160_comp, &rec_idx)) {
+        process_bitcoin_match(cur_priv, pt, h160_comp, thread_id);
+    }
+    if (check_and_verify(h160_unc, &rec_idx)) {
+        process_bitcoin_match(cur_priv, pt, h160_unc, thread_id);
+    }
+}
+
+static void worker_function(int thread_id) {
+    int core_id = btc_get_big_core_id(thread_id);
+    btc_pin_thread(core_id);
 
     uint8_t priv_bytes[32];
     Int k_int;
     Point current_pub;
     unsigned long long local_count = 0;
-    
+
     std::mt19937_64 rng((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() ^ (uint64_t)thread_id);
 
     if (!g_random_mode) {
+        // Sequential Search: Each thread searches a block of BATCH_SIZE keys,
+        // then steps forward by BATCH_SIZE * g_num_threads.
         copy_256(priv_bytes, g_start_key);
-        add_small_uint(priv_bytes, (uint64_t)thread_id);
+        add_small_uint(priv_bytes, (uint64_t)thread_id * (uint64_t)BATCH_SIZE);
         if (cmp_256(priv_bytes, g_end_key) >= 0) {
             g_threads_done.fetch_add(1, std::memory_order_release);
             return;
         }
-        
+
         bytes_to_int_obj(priv_bytes, k_int);
         current_pub = g_secp->ComputePublicKey(&k_int);
 
@@ -839,9 +828,12 @@ static void worker_function(int thread_id) {
         IntGroup modGroup(BATCH_STEPS);
 
         for (int i = 0; i < BATCH_STEPS; i++) {
-            Int k_step((uint64_t)(i + 1) * (uint64_t)g_num_threads);
+            Int k_step((uint64_t)(i + 1));
             step_table[i] = g_secp->ComputePublicKey(&k_step);
         }
+
+        Int k_stride((uint64_t)BATCH_SIZE * (uint64_t)g_num_threads);
+        Point P_stride = g_secp->ComputePublicKey(&k_stride);
 
         while (!g_stop.load(std::memory_order_relaxed)) {
             compute_batch_points(current_pub, step_table, modGroup, deltaX, zero_flag, pts);
@@ -853,21 +845,14 @@ static void worker_function(int thread_id) {
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
                 copy_256(cur_priv, batch_start_priv);
-                add_small_uint(cur_priv, (uint64_t)i * (uint64_t)g_num_threads);
+                add_small_uint(cur_priv, (uint64_t)i);
 
                 if (cmp_256(cur_priv, g_end_key) >= 0) {
                     range_reached = true;
                     break;
                 }
 
-                uint8_t h160_comp[20];
-                uint8_t h160_unc[20];
-                g_secp->GetHash160(P2PKH, true, pts[i], h160_comp);
-                g_secp->GetHash160(P2PKH, false, pts[i], h160_unc);
-                uint64_t rec_idx = 0;
-                if (check_and_verify(h160_comp, &rec_idx) || check_and_verify(h160_unc, &rec_idx)) {
-                    process_hit(cur_priv, pts[i], h160_comp, h160_unc, thread_id);
-                }
+                verify_dual_pipeline(cur_priv, pts[i], thread_id);
             }
 
             local_count += BATCH_SIZE;
@@ -880,13 +865,13 @@ static void worker_function(int thread_id) {
             if (range_reached) break;
 
             add_small_uint(priv_bytes, (uint64_t)BATCH_SIZE * (uint64_t)g_num_threads);
-            bytes_to_int_obj(priv_bytes, k_int);
-            current_pub = g_secp->ComputePublicKey(&k_int);
+            if (cmp_256(priv_bytes, g_end_key) >= 0) break;
 
-            if (g_stop.load(std::memory_order_relaxed)) break;
+            current_pub = g_secp->AddDirect(current_pub, P_stride);
         }
 
-    } else { // g_random_mode == true
+    } else {
+        // Random Bidirectional Search
         Point step_table_fwd[BATCH_STEPS];
         Point step_table_bwd[BATCH_STEPS];
         Int deltaX[BATCH_STEPS];
@@ -900,9 +885,9 @@ static void worker_function(int thread_id) {
             step_table_bwd[i] = g_secp->Negation(step_table_fwd[i]);
         }
 
-        Int k_256((uint64_t)BATCH_SIZE);
-        Point step_table_fwd_256 = g_secp->ComputePublicKey(&k_256);
-        Point step_table_bwd_256 = g_secp->Negation(step_table_fwd_256);
+        Int k_batch((uint64_t)BATCH_SIZE);
+        Point step_table_fwd_batch = g_secp->ComputePublicKey(&k_batch);
+        Point step_table_bwd_batch = g_secp->Negation(step_table_fwd_batch);
 
         Int k_1((uint64_t)1);
         Point G_1 = g_secp->ComputePublicKey(&k_1);
@@ -933,7 +918,7 @@ static void worker_function(int thread_id) {
         auto anchor_start = std::chrono::steady_clock::now();
 
         while (!g_stop.load(std::memory_order_relaxed)) {
-            // --- 1. Forward Batch Sweep (256 keys via IntGroup Montgomery Batch Inversion) ---
+            // Forward sweep
             compute_batch_points(fwd_pub, step_table_fwd, modGroup, deltaX, zero_flag, pts);
 
             for (int i = 0; i < BATCH_SIZE; i++) {
@@ -942,24 +927,17 @@ static void worker_function(int thread_id) {
                 add_small_uint(cur_priv, (uint64_t)i);
 
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    uint8_t h160_comp[20];
-                    uint8_t h160_unc[20];
-                    g_secp->GetHash160(P2PKH, true, pts[i], h160_comp);
-                    g_secp->GetHash160(P2PKH, false, pts[i], h160_unc);
-                    uint64_t rec_idx = 0;
-                    if (check_and_verify(h160_comp, &rec_idx) || check_and_verify(h160_unc, &rec_idx)) {
-                        process_hit(cur_priv, pts[i], h160_comp, h160_unc, thread_id);
-                    }
+                    verify_dual_pipeline(cur_priv, pts[i], thread_id);
                 }
             }
 
             add_small_uint(fwd_priv, (uint64_t)BATCH_SIZE);
-            fwd_pub = g_secp->AddDirect(fwd_pub, step_table_fwd_256);
+            fwd_pub = g_secp->AddDirect(fwd_pub, step_table_fwd_batch);
             local_count += BATCH_SIZE;
 
             if (g_stop.load(std::memory_order_relaxed)) break;
 
-            // --- 2. Backward Batch Sweep (256 keys via IntGroup Montgomery Batch Inversion) ---
+            // Backward sweep
             compute_batch_points(bwd_pub, step_table_bwd, modGroup, deltaX, zero_flag, pts);
 
             for (int i = 0; i < BATCH_SIZE; i++) {
@@ -968,19 +946,12 @@ static void worker_function(int thread_id) {
                 sub_small_uint(cur_priv, (uint64_t)i);
 
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    uint8_t h160_comp[20];
-                    uint8_t h160_unc[20];
-                    g_secp->GetHash160(P2PKH, true, pts[i], h160_comp);
-                    g_secp->GetHash160(P2PKH, false, pts[i], h160_unc);
-                    uint64_t rec_idx = 0;
-                    if (check_and_verify(h160_comp, &rec_idx) || check_and_verify(h160_unc, &rec_idx)) {
-                        process_hit(cur_priv, pts[i], h160_comp, h160_unc, thread_id);
-                    }
+                    verify_dual_pipeline(cur_priv, pts[i], thread_id);
                 }
             }
 
             sub_small_uint(bwd_priv, (uint64_t)BATCH_SIZE);
-            bwd_pub = g_secp->AddDirect(bwd_pub, step_table_bwd_256);
+            bwd_pub = g_secp->AddDirect(bwd_pub, step_table_bwd_batch);
             local_count += BATCH_SIZE;
 
             if (local_count >= 1024) {
@@ -1001,7 +972,7 @@ static void worker_function(int thread_id) {
         g_total_keys.fetch_add(local_count, std::memory_order_relaxed);
         g_thread_counters[thread_id].fetch_add(local_count, std::memory_order_relaxed);
     }
-    
+
     g_threads_done.fetch_add(1, std::memory_order_release);
 }
 
@@ -1009,7 +980,7 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
     std::ostringstream b;
     char lb[160];
 
-    b << "-|<.>BTCMobile Zoey Alejandroo JF >\n";
+    b << "-|<.>.BTCMobile Zoey Alejandroo JF >\n";
     b << "-|<.>\\_____________________________________/\n";
     b << "-|<.>.................................................................\n";
 
@@ -1053,7 +1024,7 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
         double pct = (double)((long double)total / size_ld * 100.0L);
         if (pct > 100.0) pct = 100.0;
 
-        b << "-|<.>.Range Progrese/s >\n";
+        b << "-|<.>.Range Progress >\n";
         b << "-|<.>\\_____________________________________/\n";
         b << "-|<.>..................................................................\n";
         b << "-|<.>.[";
@@ -1068,7 +1039,7 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
         b << "-|<.>\\________________________________________________________________/\n";
         b << "-|<.>..................................................................\n";
     } else {
-        b << "-|<.>.Search Type:Bidireccional-Random-Posittions >\n";
+        b << "-|<.>.Search Type : Bidirectional Random Positions >\n";
         b << "-|<.>\\_____________________________________/\n";
         int seed_shift = render_cycle * 13;
         for (int r = 0; r < 6; r++) {
@@ -1076,8 +1047,8 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
                 int x = (r * 67 + c * 7 + seed_shift) % 100;
                 if (x < 45) b << ' ';
                 else if (x < 75) b << '.';
-                else if (x < 90) b << "•";
-                else b << "●";
+                else if (x < 90) b << "*";
+                else b << "#";
             }
             b << "\n";
         }
@@ -1112,7 +1083,7 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
 
     double xor_rate = 0.0;
     if (total_all > 0) xor_rate = (double)g_xor_hits.load(std::memory_order_relaxed) * 100.0 / (double)total_all;
-    snprintf(lb, sizeof(lb), "-|<.>.[Xor-Filter : %.2f] >\n", xor_rate);
+    snprintf(lb, sizeof(lb), "-|<.>.[Xor-Filter : %.2f%%] >\n", xor_rate);
     b << lb;
     b << "-|<.>\\_____________________________________/\n";
     b << "-|<.>..................................................................\n";
@@ -1154,127 +1125,118 @@ static void render_display(std::vector<unsigned long long> &prev_counts, double 
 int run_single_range(int bits) {
     g_range_bits = bits;
     initialize_range(bits);
-    
+
     g_threads_done.store(0, std::memory_order_relaxed);
     g_thread_counters.reset(new std::atomic<unsigned long long>[g_num_threads]);
-    for(int i=0;i<g_num_threads;i++) g_thread_counters[i].store(0);
-    
+    for (int i = 0; i < g_num_threads; i++) g_thread_counters[i].store(0);
+
     std::vector<std::thread> workers;
-    for(int i=0;i<g_num_threads;i++){
+    for (int i = 0; i < g_num_threads; i++) {
         workers.emplace_back(worker_function, i);
     }
-    
+
     std::vector<unsigned long long> prev_counts(g_num_threads, 0);
     g_display_lines = 0;
     int render_cycle = 0;
     auto last_time = std::chrono::steady_clock::now();
     auto next_render = last_time + std::chrono::seconds(15);
-    
-    while(!g_stop.load(std::memory_order_relaxed)){
+
+    while (!g_stop.load(std::memory_order_relaxed)) {
         if (g_threads_done.load(std::memory_order_acquire) == g_num_threads) {
             break;
         }
-        
+
         auto now = std::chrono::steady_clock::now();
-        if(now < next_render){
+        if (now < next_render) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
         double elapsed = std::chrono::duration<double>(now - last_time).count();
-        if(elapsed <= 0.0) elapsed = 15.0;
-        
+        if (elapsed <= 0.0) elapsed = 15.0;
+
         render_cycle++;
         render_display(prev_counts, elapsed, bits, render_cycle);
-        
+
         last_time = now;
         next_render = now + std::chrono::seconds(15);
     }
-    
-    for(auto &t : workers){
-        if(t.joinable()) t.join();
+
+    for (auto &t : workers) {
+        if (t.joinable()) t.join();
     }
-    
-    fprintf(stderr, "[OK] Rango %d completado: %llu match(es)\n", bits, (unsigned long long)g_found_count.load());
-    
+
+    printf("\n[OK] Range %d search completed: %llu matches found.\n", bits, (unsigned long long)g_found_count.load());
     return 0;
 }
 
 int main(int argc, char **argv) {
     int bits_arg = 0;
     bool mode_specified = false;
-    
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-R") == 0 && i + 1 < argc) {
-            if (strcasecmp(argv[i+1], "all") == 0) {
-                g_all_ranges = true;
-                i++;
-            } else {
-                bits_arg = atoi(argv[++i]);
+            bits_arg = atoi(argv[++i]);
+            if (bits_arg < 1 || bits_arg > 256) {
+                fprintf(stderr, "[ERROR] Range -R must be an integer between 1 and 256.\n\n");
+                print_usage(argv[0]);
+                return 1;
             }
         } else if (strcmp(argv[i], "-S") == 0) {
             g_random_mode = false;
             mode_specified = true;
-        } else if (strcasecmp(argv[i], "-Random") == 0) {
+        } else if (strcmp(argv[i], "-Random") == 0 || strcasecmp(argv[i], "-random") == 0) {
             g_random_mode = true;
             mode_specified = true;
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             g_num_threads = atoi(argv[++i]);
-        } else if (argv[i][0] == '-' && argv[i][1] >= '0' && argv[i][1] <= '9') {
-            g_num_threads = atoi(argv[i] + 1);
         } else {
             fprintf(stderr, "[ERROR] Unrecognized flag: %s\n\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
     }
-    
+
+    if (bits_arg == 0) {
+        bits_arg = 71; // Default range
+    }
+
     if (!mode_specified) {
         g_random_mode = false;
     }
-    
-    int little;
+
+    int little = 0;
     btc_detect_cores(&g_cpu_cores, &g_big_cores, &little);
     if (g_cpu_cores < 1) g_cpu_cores = 1;
     if (g_big_cores < 1) g_big_cores = g_cpu_cores;
 
     if (g_num_threads <= 0) {
         g_num_threads = g_big_cores;
-    } else if (g_num_threads > g_big_cores) {
+    } else if (g_num_threads > g_big_cores && g_big_cores > 0) {
         g_num_threads = g_big_cores;
     }
     if (g_num_threads > 32) g_num_threads = 32;
-    
+
     g_secp = new Secp256K1();
     g_secp->Init();
-    build_increment_points();
-    
-    init_memory_loading();
-    
+
+    init_storage_selection();
+
     if (load_database_files() != 0) {
         delete g_secp;
         return 1;
     }
-    
-    run_diagnostic_k1();
-    
+
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    
-    if (g_all_ranges || bits_arg == 0) {
-        for (int b = 1; b <= 256; b++) {
-            if (g_stop.load(std::memory_order_relaxed)) break;
-            run_single_range(b);
-        }
-        fprintf(stderr, "[OK] Todos los rangos completados\n");
-    } else {
-        if (bits_arg <= 0) bits_arg = 71;
-        if (bits_arg > 256) bits_arg = 256;
-        run_single_range(bits_arg);
+
+    run_single_range(bits_arg);
+
+    if (g_bin_map) {
+        if (g_mem_mode_bin == 1) free(g_bin_map);
+        else munmap(g_bin_map, g_bin_size);
     }
-    
-    if(g_bin_file) fclose(g_bin_file);
-    if(g_bin_map) munmap(g_bin_map, g_bin_size);
+    if (g_bin_fd >= 0) close(g_bin_fd);
     btc_free_xor(&g_xorf);
     btc_free_idx(&g_idx);
 
