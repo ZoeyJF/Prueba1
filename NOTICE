@@ -1,0 +1,35 @@
+BTCMobile
+Copyright 2026 ZoeyJF
+
+This product includes third-party software:
+
+· sse2neon.h (Copyright (C) 2015-2026 // This header file provides a simple API translation layer
+  // between SSE intrinsics to their corresponding Arm/Aarch64 NEON versions
+  //   John W. Ratcliff 
+  //   Brandon Rowlett 
+  //   Ken Fast 
+  //   Eric van Beurden 
+  //   Alexander Potylitsin 
+  //   Hasindu Gamaarachchi 
+  //   Jim Huang 
+  //   Mark Cheng 
+  //   Malcolm James MacLeod 
+  //   Devin Hussey (easyaspi314) 
+  //   Sebastian Pop 
+  //   Developer Ecosystem Engineering 
+  //   Danila Kutenin 
+  //   François Turban (JishinMaster) 
+  //   Pei-Hsuan Hung 
+  //   Yang-Hao Yuan 
+  //   Syoyo Fujita 
+  //   Brecht Van Lommel 
+  //   Jonathan Hue 
+  //   Cuda Chen 
+  //   Aymen Qader 
+  //   Anthony Roberts 
+  //   Sean Luchen 
+  //   Marcin Serwin 
+  //   Ben Niu 
+  //   Even Rouault 
+  //   Marcus Buretorp ) - MIT License.
+· xxhash.h (Copyright (C) 2012-2020 Yann Collet) - 2-clause BSD License
