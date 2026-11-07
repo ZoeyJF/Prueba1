@@ -98,8 +98,8 @@ static const char *ORDER_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03B
 static const char *BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const char *BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
-// Batch size 512 keys for high performance Montgomery batch inversion
-static const int BATCH_SIZE = 512;
+// High-performance 1024-key Montgomery batch inversion (1 single modular inversion per 1024 keys)
+static const int BATCH_SIZE = 1024;
 static const int BATCH_STEPS = BATCH_SIZE - 1;
 
 static void sig_handler(int) {
