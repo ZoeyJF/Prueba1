@@ -69,7 +69,6 @@ static std::atomic<unsigned long long> g_xor_hits{0};
 static std::atomic<unsigned long long> g_found_count{0};
 static std::atomic<int> g_threads_done{0};
 
-static std::mutex g_io_mutex;
 static std::mutex g_found_mutex;
 static std::vector<FoundLogEntry> g_found_logs;
 static int g_display_lines = 0;
@@ -98,9 +97,20 @@ static const char *ORDER_HEX = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03B
 static const char *BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 static const char *BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
-// High-performance 1024-key Montgomery batch inversion (1 single modular inversion per 1024 keys)
+// 1024-key Montgomery batch inversion (1 single modular inversion per 1024 points)
 static const int BATCH_SIZE = 1024;
 static const int BATCH_STEPS = BATCH_SIZE - 1;
+
+// Heap-allocated scratch space to guarantee tiny stack frame (<4 KB) on mobile ARM64/Termux
+struct WorkerScratch {
+    Point pts[BATCH_SIZE];
+    Point step_table[BATCH_STEPS];
+    Int deltaX[BATCH_STEPS];
+    bool zero_flag[BATCH_STEPS];
+    uint8_t batch_privs[BATCH_SIZE][32];
+    Point batch_pts[BATCH_SIZE];
+    Point step_table_bwd[BATCH_STEPS];
+};
 
 static void sig_handler(int) {
     g_stop.store(true, std::memory_order_relaxed);
@@ -335,27 +345,9 @@ static void generate_bech32_p2wpkh(const uint8_t *h160, char *out, size_t outsiz
     out[k] = 0;
 }
 
-static void generate_eth_address(const uint8_t *pub_uncompressed_xy, char *out, size_t outsize) {
-    SHA3_256_CTX ctx;
-    uint8_t hash[32];
-    KECCAK_256_Init(&ctx);
-    KECCAK_256_Update(&ctx, pub_uncompressed_xy, 64);
-    KECCAK_256_Final(hash, &ctx);
-
-    if (outsize < 43) { out[0] = 0; return; }
-    size_t pos = 0;
-    out[pos++] = '0';
-    out[pos++] = 'x';
-    for (int i = 12; i < 32; i++) {
-        sprintf(out + pos, "%02x", hash[i]);
-        pos += 2;
-    }
-    out[pos] = 0;
-}
-
 static void bytes_to_int_obj(const uint8_t *bytes, Int &obj) {
     char hex[65];
-    for (int i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", bytes[i]);
+    for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02x", bytes[i]);
     obj.SetBase16(hex);
 }
 
@@ -502,7 +494,6 @@ static int load_database_files() {
     g_bin_size = bst.st_size;
 
     if (g_mem_mode_bin == 1) {
-        // Full in-memory buffer: chunked read to support > 2 GB files safely
         g_bin_map = (uint8_t*)malloc(g_bin_size > 0 ? g_bin_size : 1);
         if (g_bin_map) {
             uint64_t total_read = 0;
@@ -525,7 +516,6 @@ static int load_database_files() {
             fprintf(stderr, "[WARN] Failed allocating RAM for %s, falling back to pread64\n", BIN_FILE);
         }
     } else {
-        // Disk MMAP
         g_bin_map = (uint8_t*)mmap(NULL, g_bin_size, PROT_READ, MAP_PRIVATE, g_bin_fd, 0);
         if (g_bin_map == MAP_FAILED) {
             fprintf(stderr, "[WARN] mmap failed for %s, falling back to pread64\n", BIN_FILE);
@@ -553,7 +543,6 @@ static bool check_and_verify(const uint8_t h160[20], uint64_t *rec_idx_out) {
 
     if (g_idx.format_type == IDX_FORMAT_FULL) {
         if (btc_binary_search_idx(&g_idx, h160, &record_index) == 0) {
-            // Confirm in BTC.bin
             if (g_bin_map) {
                 if (record_index * HASH160_LEN + HASH160_LEN <= g_bin_size) {
                     if (memcmp(g_bin_map + (record_index * HASH160_LEN), h160, HASH160_LEN) == 0) {
@@ -567,7 +556,6 @@ static bool check_and_verify(const uint8_t h160[20], uint64_t *rec_idx_out) {
             }
         }
     } else {
-        // Sparse index
         const idx_record_sparse_t *sparse_recs = (const idx_record_sparse_t*)g_idx.records;
         uint64_t low = 0;
         uint64_t high = g_idx.count;
@@ -630,10 +618,9 @@ static void log_found_match(const std::string &msg) {
 
     FoundLogEntry entry;
     entry.message = msg;
-    entry.remaining_cycles = 2; // Displayed for 2 refresh cycles (30s)
+    entry.remaining_cycles = 2;
     g_found_logs.push_back(entry);
 
-    // Print immediately to console
     printf("\n%s\n", msg.c_str());
     fflush(stdout);
 }
@@ -725,8 +712,7 @@ static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, cons
 }
 
 /*
- * Montgomery Batch Inversion Affine Addition
- * Computes BATCH_SIZE affine points from base point using 1 modular inversion.
+ * High-performance 1024-Key Montgomery Batch Inversion for Affine Curve Addition
  */
 static inline void compute_batch_points(
     Point base_pub,
@@ -771,57 +757,103 @@ static inline void compute_batch_points(
     }
 }
 
-static inline void verify_dual_pipeline(
-    const uint8_t cur_priv[32],
-    Point &pt,
+/*
+ * Multi-Way Dual Verification Pipeline (Ethereum Keccak-256 -> Bitcoin Hash160)
+ */
+static inline void verify_dual_pipeline_4way(
+    const uint8_t privs[4][32],
+    Point pts[4],
     int thread_id
 ) {
-    // Step 1: Ethereum (Keccak-256 over uncompressed coordinates X, Y -> 64 bytes)
-    unsigned char raw_pub[65];
-    g_secp->GetPublicKeyRaw(false, pt, (char*)raw_pub);
+    // 1. Ethereum Verification (Keccak-256 over uncompressed coordinates X, Y -> 64 bytes)
+    for (int k = 0; k < 4; k++) {
+        unsigned char raw_pub[65];
+        g_secp->GetPublicKeyRaw(false, pts[k], (char*)raw_pub);
 
-    SHA3_256_CTX keccak_ctx;
-    uint8_t keccak_hash[32];
-    KECCAK_256_Init(&keccak_ctx);
-    KECCAK_256_Update(&keccak_ctx, raw_pub + 1, 64);
-    KECCAK_256_Final(keccak_hash, &keccak_ctx);
+        SHA3_256_CTX keccak_ctx;
+        uint8_t keccak_hash[32];
+        KECCAK_256_Init(&keccak_ctx);
+        KECCAK_256_Update(&keccak_ctx, raw_pub + 1, 64);
+        KECCAK_256_Final(keccak_hash, &keccak_ctx);
 
-    uint8_t eth_hash[20];
-    memcpy(eth_hash, keccak_hash + 12, 20);
+        uint8_t eth_hash[20];
+        memcpy(eth_hash, keccak_hash + 12, 20);
 
-    uint64_t rec_idx = 0;
-    if (check_and_verify(eth_hash, &rec_idx)) {
-        process_ethereum_match(cur_priv, pt, eth_hash, thread_id);
+        uint64_t rec_idx = 0;
+        if (check_and_verify(eth_hash, &rec_idx)) {
+            process_ethereum_match(privs[k], pts[k], eth_hash, thread_id);
+        }
     }
 
-    // Step 2: Bitcoin (Compressed and Uncompressed Hash160)
-    uint8_t h160_comp[20];
-    uint8_t h160_unc[20];
-    g_secp->GetHash160(P2PKH, true, pt, h160_comp);
-    g_secp->GetHash160(P2PKH, false, pt, h160_unc);
+    // 2. Bitcoin Verification (Compressed & Uncompressed Hash160)
+    for (int k = 0; k < 4; k++) {
+        uint8_t h160_comp[20];
+        uint8_t h160_unc[20];
+        g_secp->GetHash160(P2PKH, true, pts[k], h160_comp);
+        g_secp->GetHash160(P2PKH, false, pts[k], h160_unc);
 
-    if (check_and_verify(h160_comp, &rec_idx)) {
-        process_bitcoin_match(cur_priv, pt, h160_comp, thread_id);
-    }
-    if (check_and_verify(h160_unc, &rec_idx)) {
-        process_bitcoin_match(cur_priv, pt, h160_unc, thread_id);
+        uint64_t rec_idx = 0;
+        if (check_and_verify(h160_comp, &rec_idx)) {
+            process_bitcoin_match(privs[k], pts[k], h160_comp, thread_id);
+        }
+        if (check_and_verify(h160_unc, &rec_idx)) {
+            process_bitcoin_match(privs[k], pts[k], h160_unc, thread_id);
+        }
     }
 }
 
-static void worker_function(int thread_id) {
+static inline void process_batch_verification(
+    const uint8_t privs[][32],
+    Point pts[],
+    int n_points,
+    int thread_id
+) {
+    for (int i = 0; i < n_points; i += 4) {
+        int chunk_k = (i + 4 <= n_points) ? 4 : (n_points - i);
+        uint8_t sub_privs[4][32];
+        Point sub_pts[4];
+
+        for (int k = 0; k < chunk_k; k++) {
+            copy_256(sub_privs[k], privs[i + k]);
+            sub_pts[k] = pts[i + k];
+        }
+
+        if (chunk_k == 4) {
+            verify_dual_pipeline_4way(sub_privs, sub_pts, thread_id);
+        } else {
+            for (int k = 0; k < chunk_k; k++) {
+                uint8_t single_priv[4][32];
+                Point single_pts[4];
+                copy_256(single_priv[0], sub_privs[k]);
+                single_pts[0] = sub_pts[k];
+                verify_dual_pipeline_4way(single_priv, single_pts, thread_id);
+            }
+        }
+    }
+
+    g_total_keys.fetch_add(n_points, std::memory_order_relaxed);
+    g_thread_counters[thread_id].fetch_add(n_points, std::memory_order_relaxed);
+}
+
+/*
+ * Worker Thread: Pinned to Big/Prime core with thread-isolated point generation & verification
+ */
+static void worker_thread(int thread_id) {
     int core_id = btc_get_big_core_id(thread_id);
     btc_pin_thread(core_id);
+
+    // Allocate scratch space once on heap to guarantee safe stack usage (<4 KB)
+    std::unique_ptr<WorkerScratch> scratch(new WorkerScratch());
+    IntGroup modGroup(BATCH_STEPS);
 
     uint8_t priv_bytes[32];
     Int k_int;
     Point current_pub;
-    unsigned long long local_count = 0;
 
     std::mt19937_64 rng((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() ^ (uint64_t)thread_id);
 
     if (!g_random_mode) {
-        // Sequential Search: Each thread searches a block of BATCH_SIZE keys,
-        // then steps forward by BATCH_SIZE * g_num_threads.
+        // Sequential Forward Search
         copy_256(priv_bytes, g_start_key);
         add_small_uint(priv_bytes, (uint64_t)thread_id * (uint64_t)BATCH_SIZE);
         if (cmp_256(priv_bytes, g_end_key) >= 0) {
@@ -832,48 +864,33 @@ static void worker_function(int thread_id) {
         bytes_to_int_obj(priv_bytes, k_int);
         current_pub = g_secp->ComputePublicKey(&k_int);
 
-        Point step_table[BATCH_STEPS];
-        Int deltaX[BATCH_STEPS];
-        Point pts[BATCH_SIZE];
-        bool zero_flag[BATCH_STEPS];
-        IntGroup modGroup(BATCH_STEPS);
-
         for (int i = 0; i < BATCH_STEPS; i++) {
             Int k_step((uint64_t)(i + 1));
-            step_table[i] = g_secp->ComputePublicKey(&k_step);
+            scratch->step_table[i] = g_secp->ComputePublicKey(&k_step);
         }
 
         Int k_stride((uint64_t)BATCH_SIZE * (uint64_t)g_num_threads);
         Point P_stride = g_secp->ComputePublicKey(&k_stride);
 
         while (!g_stop.load(std::memory_order_relaxed)) {
-            compute_batch_points(current_pub, step_table, modGroup, deltaX, zero_flag, pts);
+            compute_batch_points(current_pub, scratch->step_table, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
-            uint8_t batch_start_priv[32];
-            copy_256(batch_start_priv, priv_bytes);
-
-            bool range_reached = false;
+            int valid_count = 0;
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
-                copy_256(cur_priv, batch_start_priv);
+                copy_256(cur_priv, priv_bytes);
                 add_small_uint(cur_priv, (uint64_t)i);
-
-                if (cmp_256(cur_priv, g_end_key) >= 0) {
-                    range_reached = true;
-                    break;
-                }
-
-                verify_dual_pipeline(cur_priv, pts[i], thread_id);
+                if (cmp_256(cur_priv, g_end_key) >= 0) break;
+                copy_256(scratch->batch_privs[valid_count], cur_priv);
+                scratch->batch_pts[valid_count] = scratch->pts[i];
+                valid_count++;
             }
 
-            local_count += BATCH_SIZE;
-            if (local_count >= 1024) {
-                g_total_keys.fetch_add(local_count, std::memory_order_relaxed);
-                g_thread_counters[thread_id].fetch_add(local_count, std::memory_order_relaxed);
-                local_count = 0;
+            if (valid_count > 0) {
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_count, thread_id);
             }
 
-            if (range_reached) break;
+            if (valid_count < BATCH_SIZE) break;
 
             add_small_uint(priv_bytes, (uint64_t)BATCH_SIZE * (uint64_t)g_num_threads);
             if (cmp_256(priv_bytes, g_end_key) >= 0) break;
@@ -883,17 +900,10 @@ static void worker_function(int thread_id) {
 
     } else {
         // Random Bidirectional Search
-        Point step_table_fwd[BATCH_STEPS];
-        Point step_table_bwd[BATCH_STEPS];
-        Int deltaX[BATCH_STEPS];
-        Point pts[BATCH_SIZE];
-        bool zero_flag[BATCH_STEPS];
-        IntGroup modGroup(BATCH_STEPS);
-
         for (int i = 0; i < BATCH_STEPS; i++) {
             Int k_step((uint64_t)(i + 1));
-            step_table_fwd[i] = g_secp->ComputePublicKey(&k_step);
-            step_table_bwd[i] = g_secp->Negation(step_table_fwd[i]);
+            scratch->step_table[i] = g_secp->ComputePublicKey(&k_step);
+            scratch->step_table_bwd[i] = g_secp->Negation(scratch->step_table[i]);
         }
 
         Int k_batch((uint64_t)BATCH_SIZE);
@@ -929,47 +939,51 @@ static void worker_function(int thread_id) {
         auto anchor_start = std::chrono::steady_clock::now();
 
         while (!g_stop.load(std::memory_order_relaxed)) {
-            // Forward sweep
-            compute_batch_points(fwd_pub, step_table_fwd, modGroup, deltaX, zero_flag, pts);
+            // Forward batch sweep
+            compute_batch_points(fwd_pub, scratch->step_table, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
+            int valid_fwd = 0;
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
                 copy_256(cur_priv, fwd_priv);
                 add_small_uint(cur_priv, (uint64_t)i);
-
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    verify_dual_pipeline(cur_priv, pts[i], thread_id);
+                    copy_256(scratch->batch_privs[valid_fwd], cur_priv);
+                    scratch->batch_pts[valid_fwd] = scratch->pts[i];
+                    valid_fwd++;
                 }
+            }
+
+            if (valid_fwd > 0) {
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_fwd, thread_id);
             }
 
             add_small_uint(fwd_priv, (uint64_t)BATCH_SIZE);
             fwd_pub = g_secp->AddDirect(fwd_pub, step_table_fwd_batch);
-            local_count += BATCH_SIZE;
 
             if (g_stop.load(std::memory_order_relaxed)) break;
 
-            // Backward sweep
-            compute_batch_points(bwd_pub, step_table_bwd, modGroup, deltaX, zero_flag, pts);
+            // Backward batch sweep
+            compute_batch_points(bwd_pub, scratch->step_table_bwd, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
+            int valid_bwd = 0;
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
                 copy_256(cur_priv, bwd_priv);
                 sub_small_uint(cur_priv, (uint64_t)i);
-
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    verify_dual_pipeline(cur_priv, pts[i], thread_id);
+                    copy_256(scratch->batch_privs[valid_bwd], cur_priv);
+                    scratch->batch_pts[valid_bwd] = scratch->pts[i];
+                    valid_bwd++;
                 }
+            }
+
+            if (valid_bwd > 0) {
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_bwd, thread_id);
             }
 
             sub_small_uint(bwd_priv, (uint64_t)BATCH_SIZE);
             bwd_pub = g_secp->AddDirect(bwd_pub, step_table_bwd_batch);
-            local_count += BATCH_SIZE;
-
-            if (local_count >= 1024) {
-                g_total_keys.fetch_add(local_count, std::memory_order_relaxed);
-                g_thread_counters[thread_id].fetch_add(local_count, std::memory_order_relaxed);
-                local_count = 0;
-            }
 
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - anchor_start).count() >= 5) {
@@ -977,11 +991,6 @@ static void worker_function(int thread_id) {
                 anchor_start = now;
             }
         }
-    }
-
-    if (local_count) {
-        g_total_keys.fetch_add(local_count, std::memory_order_relaxed);
-        g_thread_counters[thread_id].fetch_add(local_count, std::memory_order_relaxed);
     }
 
     g_threads_done.fetch_add(1, std::memory_order_release);
@@ -1141,9 +1150,10 @@ int run_single_range(int bits) {
     g_thread_counters.reset(new std::atomic<unsigned long long>[g_num_threads]);
     for (int i = 0; i < g_num_threads; i++) g_thread_counters[i].store(0);
 
+    // Launch worker threads pinned to Big/Prime cores
     std::vector<std::thread> workers;
     for (int i = 0; i < g_num_threads; i++) {
-        workers.emplace_back(worker_function, i);
+        workers.emplace_back(worker_thread, i);
     }
 
     std::vector<unsigned long long> prev_counts(g_num_threads, 0);
@@ -1152,12 +1162,11 @@ int run_single_range(int bits) {
     auto start_time = std::chrono::steady_clock::now();
     auto last_time = start_time;
 
-    // Render initial dashboard immediately on startup so user does not wait 15 seconds
     render_display(prev_counts, 0.0, bits, 0);
     auto next_render = last_time + std::chrono::seconds(15);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
-        if (g_threads_done.load(std::memory_order_acquire) == g_num_threads) {
+        if (g_threads_done.load(std::memory_order_acquire) >= g_num_threads) {
             break;
         }
 
@@ -1213,7 +1222,7 @@ int main(int argc, char **argv) {
     }
 
     if (bits_arg == 0) {
-        bits_arg = 71; // Default range
+        bits_arg = 71;
     }
 
     if (!mode_specified) {

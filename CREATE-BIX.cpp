@@ -35,6 +35,8 @@
 #include <queue>
 #include "Secp256k1/BTC.h"
 #include "Secp256k1/xorfilter.h"
+#include "Secp256k1/sha256.h"
+#include "Secp256k1/ripemd160.h"
 
 #define IO_BUFFER_SIZE (4 * 1024 * 1024)
 #define CHUNK_SIZE (1024 * 1024)
@@ -51,28 +53,208 @@ static void print_warn(const char *msg) {
     fprintf(stderr, "[WARN] %s\n", msg);
 }
 
-static int parse_hex_hash(const std::string &line, uint8_t *out) {
-    if (line.length() < 40) return -1;
+static const int B58_MAP[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1, 0, 1, 2, 3, 4, 5, 6,  7, 8,-1,-1,-1,-1,-1,-1,
+    -1, 9,10,11,12,13,14,15, 16,-1,17,18,19,20,21,-1,
+    22,23,24,25,26,27,28,29, 30,31,32,-1,-1,-1,-1,-1,
+    -1,33,34,35,36,37,38,39, 40,41,42,43,-1,44,45,46,
+    47,48,49,50,51,52,53,54, 55,56,57,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1
+};
 
-    for (int i = 0; i < 20; i++) {
-        char hi = line[i * 2];
-        char lo = line[i * 2 + 1];
+static const int8_t BECH32_MAP[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    15,-1,10,17,21,20,26,30,  7, 5,-1,-1,-1,-1,-1,-1,
+    -1,29,-1,24,13,25, 9, 8, 23,-1,18,22,31,27,19,-1,
+     1, 0, 3,16,11,28,12,14,  6, 4, 2,-1,-1,-1,-1,-1,
+    -1,29,-1,24,13,25, 9, 8, 23,-1,18,22,31,27,19,-1,
+     1, 0, 3,16,11,28,12,14,  6, 4, 2,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1
+};
 
-        int val_hi = -1, val_lo = -1;
+static inline int parse_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-        if (hi >= '0' && hi <= '9') val_hi = hi - '0';
-        else if (hi >= 'a' && hi <= 'f') val_hi = hi - 'a' + 10;
-        else if (hi >= 'A' && hi <= 'F') val_hi = hi - 'A' + 10;
+static bool decode_base58_check(const char *str, size_t len, uint8_t *h160_out) {
+    if (len < 25 || len > 35) return false;
+    uint8_t bin[64] = {0};
+    size_t bin_len = 0;
 
-        if (lo >= '0' && lo <= '9') val_lo = lo - '0';
-        else if (lo >= 'a' && lo <= 'f') val_lo = lo - 'a' + 10;
-        else if (lo >= 'A' && lo <= 'F') val_lo = lo - 'A' + 10;
-
-        if (val_hi == -1 || val_lo == -1) return -1;
-
-        out[i] = (uint8_t)((val_hi << 4) | val_lo);
+    for (size_t i = 0; i < len; i++) {
+        int v = B58_MAP[(unsigned char)str[i]];
+        if (v < 0) return false;
+        int carry = v;
+        for (size_t j = 0; j < bin_len; j++) {
+            carry += (int)bin[j] * 58;
+            bin[j] = (uint8_t)(carry & 0xFF);
+            carry >>= 8;
+        }
+        while (carry > 0) {
+            bin[bin_len++] = (uint8_t)(carry & 0xFF);
+            carry >>= 8;
+        }
     }
-    return 0;
+
+    size_t leading_zeros = 0;
+    while (leading_zeros < len && str[leading_zeros] == '1') {
+        leading_zeros++;
+    }
+
+    size_t total_len = leading_zeros + bin_len;
+    if (total_len != 25) return false;
+
+    uint8_t decoded[25] = {0};
+    for (size_t i = 0; i < bin_len; i++) {
+        decoded[total_len - 1 - i] = bin[i];
+    }
+
+    uint8_t hash1[32], hash2[32];
+    sha256(decoded, 21, hash1);
+    sha256(hash1, 32, hash2);
+
+    if (memcmp(decoded + 21, hash2, 4) != 0) return false;
+
+    memcpy(h160_out, decoded + 1, 20);
+    return true;
+}
+
+static uint64_t bech32_polymod(const uint8_t *values, size_t len) {
+    uint64_t chk = 1;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = chk >> 25;
+        chk = ((chk & 0x1FFFFFF) << 5) ^ values[i];
+        if (b & 1)  chk ^= 0x3b6a57b2UL;
+        if (b & 2)  chk ^= 0x26508e6dUL;
+        if (b & 4)  chk ^= 0x1ea119faUL;
+        if (b & 8)  chk ^= 0x3d4233ddUL;
+        if (b & 16) chk ^= 0x2a1462b3UL;
+    }
+    return chk;
+}
+
+static bool convert_bits_5to8(const uint8_t *in, size_t inlen, uint8_t *out, size_t *outlen) {
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t o = 0;
+    uint32_t maxv = 255;
+    uint32_t max_acc = (1u << (5 + 8 - 1)) - 1;
+    for (size_t i = 0; i < inlen; i++) {
+        uint8_t value = in[i];
+        if (value >> 5) return false;
+        acc = ((acc << 5) | value) & max_acc;
+        bits += 5;
+        while (bits >= 8) {
+            bits -= 8;
+            out[o++] = (uint8_t)((acc >> bits) & maxv);
+        }
+    }
+    if (bits >= 5 || ((acc << (8 - bits)) & maxv)) {
+        return false;
+    }
+    *outlen = o;
+    return true;
+}
+
+static bool decode_bech32(const char *str, size_t len, uint8_t *h160_out) {
+    if (len < 42 || len > 90) return false;
+    if (str[0] != 'b' && str[0] != 'B') return false;
+    if (str[1] != 'c' && str[1] != 'C') return false;
+
+    size_t pos_one = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] == '1') pos_one = i;
+    }
+    if (pos_one != 2) return false;
+
+    uint8_t values[128];
+    values[0] = 3;
+    values[1] = 3;
+    values[2] = 0;
+    values[3] = (uint8_t)(str[0] & 31);
+    values[4] = (uint8_t)(str[1] & 31);
+
+    size_t v_count = 5;
+    uint8_t data5bit[128];
+    size_t count5bit = 0;
+
+    for (size_t i = 3; i < len; i++) {
+        int8_t v = BECH32_MAP[(unsigned char)str[i]];
+        if (v < 0) return false;
+        values[v_count++] = (uint8_t)v;
+        data5bit[count5bit++] = (uint8_t)v;
+    }
+
+    uint64_t chk = bech32_polymod(values, v_count);
+    bool is_bech32  = (chk == 1);
+    bool is_bech32m = (chk == 0x2bc830a3UL);
+
+    if (!is_bech32 && !is_bech32m) return false;
+
+    if (count5bit < 6) return false;
+    uint8_t witver = data5bit[0];
+    if (witver > 16) return false;
+
+    size_t payload_5bit_len = count5bit - 6 - 1;
+    uint8_t prog[64];
+    size_t prog_len = 0;
+    if (!convert_bits_5to8(data5bit + 1, payload_5bit_len, prog, &prog_len)) {
+        return false;
+    }
+
+    if (prog_len != 20) return false;
+
+    memcpy(h160_out, prog, 20);
+    return true;
+}
+
+static bool parse_hex_or_address(const char *token, size_t token_len, uint8_t *out) {
+    if ((token_len == 42 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) || token_len == 40) {
+        const char *p = (token_len == 42) ? token + 2 : token;
+        for (int i = 0; i < 20; i++) {
+            int hi = parse_hex_digit(p[i * 2]);
+            int lo = parse_hex_digit(p[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return false;
+            out[i] = (uint8_t)((hi << 4) | lo);
+        }
+        return true;
+    }
+
+    if (token_len >= 25 && token_len <= 35 && (token[0] == '1' || token[0] == '3')) {
+        return decode_base58_check(token, token_len, out);
+    }
+
+    if (token_len >= 42 && token_len <= 90 && (token[0] == 'b' || token[0] == 'B') && (token[1] == 'c' || token[1] == 'C')) {
+        return decode_bech32(token, token_len, out);
+    }
+
+    return false;
+}
+
+static bool is_word_delim(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',' || c == ';' || c == ':' || c == '"' || c == '\'' || c == '|' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}';
 }
 
 static int create_temp_chunk(std::vector<hash_entry> &chunk, int chunk_id) {
@@ -221,13 +403,7 @@ static int merge_chunks_to_bin(std::vector<std::string> &chunk_files, uint64_t *
     return 0;
 }
 
-static int stage_read_and_sort_external(const char *hex_path, uint64_t *total_unique_hashes) {
-    std::ifstream fin(hex_path);
-    if (!fin.is_open()) {
-        print_error("Cannot open input file");
-        return -1;
-    }
-
+static int stage_read_and_sort_external(const std::vector<std::string> &input_files, uint64_t *total_unique_hashes) {
     std::vector<hash_entry> chunk;
     chunk.reserve(CHUNK_SIZE);
     std::vector<std::string> chunk_files;
@@ -235,46 +411,58 @@ static int stage_read_and_sort_external(const char *hex_path, uint64_t *total_un
     uint64_t total_valid = 0;
     uint64_t skipped = 0;
 
-    std::string line;
-    while (std::getline(fin, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) {
-            line.pop_back();
-        }
-        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
-            line.erase(line.begin());
-        }
-
-        if (line.empty()) continue;
-
-        hash_entry he;
-        if (parse_hex_hash(line, he.data) != 0) {
-            skipped++;
+    for (const auto &path : input_files) {
+        std::ifstream fin(path);
+        if (!fin.is_open()) {
+            std::cerr << "[WARN] Cannot open input file: " << path << std::endl;
             continue;
         }
 
-        chunk.push_back(he);
-        total_valid++;
+        std::string line;
+        while (std::getline(fin, line)) {
+            size_t l_len = line.length();
+            size_t start_pos = 0;
+            while (start_pos < l_len) {
+                while (start_pos < l_len && is_word_delim(line[start_pos])) {
+                    start_pos++;
+                }
+                if (start_pos >= l_len) break;
 
-        if (chunk.size() >= CHUNK_SIZE) {
-            const char *tmp_env = getenv("TMPDIR");
-            std::string tdir = (tmp_env && access(tmp_env, W_OK) == 0) ? tmp_env : ((access("/tmp", W_OK) == 0) ? "/tmp" : ".");
-            char fname[512];
-            snprintf(fname, sizeof(fname), "%s/btc_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
+                size_t end_pos = start_pos;
+                while (end_pos < l_len && !is_word_delim(line[end_pos])) {
+                    end_pos++;
+                }
 
-            if (create_temp_chunk(chunk, chunk_id) != 0) {
-                fin.close();
-                return -1;
+                size_t token_len = end_pos - start_pos;
+                const char *token = line.c_str() + start_pos;
+
+                hash_entry he;
+                if (parse_hex_or_address(token, token_len, he.data)) {
+                    chunk.push_back(he);
+                    total_valid++;
+
+                    if (chunk.size() >= CHUNK_SIZE) {
+                        const char *tmp_env = getenv("TMPDIR");
+                        std::string tdir = (tmp_env && access(tmp_env, W_OK) == 0) ? tmp_env : ((access("/tmp", W_OK) == 0) ? "/tmp" : ".");
+                        char fname[512];
+                        snprintf(fname, sizeof(fname), "%s/btc_chunk_%d_%d.tmp", tdir.c_str(), (int)getpid(), chunk_id);
+
+                        if (create_temp_chunk(chunk, chunk_id) != 0) {
+                            fin.close();
+                            return -1;
+                        }
+
+                        chunk_files.push_back(fname);
+                        chunk_id++;
+                    }
+                } else {
+                    skipped++;
+                }
+
+                start_pos = end_pos;
             }
-
-            chunk_files.push_back(fname);
-            chunk_id++;
         }
-    }
-
-    fin.close();
-
-    if (skipped > 0) {
-        print_warn("Skipped invalid lines during parsing");
+        fin.close();
     }
 
     if (total_valid == 0) {
@@ -504,21 +692,30 @@ static int stage_write_xor(uint64_t n_hashes) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input_hex_file> [--sparse | --full]\n";
-        return 1;
-    }
-
+    std::vector<std::string> input_files;
     bool is_sparse = false;
     bool format_selected = false;
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--sparse") == 0 || strcmp(argv[i], "-sparse") == 0) {
             is_sparse = true;
             format_selected = true;
         } else if (strcmp(argv[i], "--full") == 0 || strcmp(argv[i], "-full") == 0) {
             is_sparse = false;
             format_selected = true;
+        } else if (argv[i][0] != '-') {
+            input_files.push_back(argv[i]);
+        }
+    }
+
+    // Default to BTC.hex if no files specified
+    if (input_files.empty()) {
+        if (access("BTC.hex", R_OK) == 0) {
+            input_files.push_back("BTC.hex");
+        } else {
+            std::cerr << "Usage: " << argv[0] << " [input_file_1 ... input_file_N] [--sparse | --full]\n";
+            std::cerr << "[ERROR] No input files specified and default BTC.hex was not found.\n";
+            return 1;
         }
     }
 
@@ -541,11 +738,11 @@ int main(int argc, char **argv) {
 
     auto start_time = std::chrono::steady_clock::now();
 
-    std::cout << "\n[INFO] Starting database generation for: " << argv[1] << "\n";
+    std::cout << "\n[INFO] Starting database generation for " << input_files.size() << " input file(s).\n";
     std::cout << "[INFO] Selected Index Format: " << (is_sparse ? "Sparse Index" : "Full Index") << "\n";
 
     uint64_t n_hashes = 0;
-    if (stage_read_and_sort_external(argv[1], &n_hashes) != 0) {
+    if (stage_read_and_sort_external(input_files, &n_hashes) != 0) {
         return 1;
     }
 
