@@ -42,6 +42,7 @@
 #include <fcntl.h>
 #include <sstream>
 #include <cmath>
+#include <iomanip>
 
 #include "Secp256k1/Secp256k1.h"
 #include "Secp256k1/BTC.h"
@@ -625,6 +626,32 @@ static void log_found_match(const std::string &msg) {
     fflush(stdout);
 }
 
+static void compute_match_position(const uint8_t priv_bytes[32], double &pct_out, int &subrange_out) {
+    long double k_ld = u256_to_ld(priv_bytes);
+    long double start_ld = u256_to_ld(g_start_key);
+    long double end_ld = u256_to_ld(g_end_key);
+    long double range_span = end_ld - start_ld;
+
+    if (range_span <= 0.0L) {
+        pct_out = 0.0;
+        subrange_out = 1;
+        return;
+    }
+
+    long double pos = k_ld - start_ld;
+    if (pos < 0.0L) pos = 0.0L;
+    if (pos > range_span) pos = range_span;
+
+    pct_out = (double)((pos / range_span) * 100.0L);
+    if (pct_out < 0.0) pct_out = 0.0;
+    if (pct_out > 100.0) pct_out = 100.0;
+
+    int sub = (int)std::floor(pct_out) + 1;
+    if (sub < 1) sub = 1;
+    if (sub > 100) sub = 100;
+    subrange_out = sub;
+}
+
 static void process_ethereum_match(const uint8_t priv_bytes[32], const Point &pub, const uint8_t eth_hash[20], int thread_id) {
     char ts[64];
     utc_timestamp(ts, sizeof(ts));
@@ -642,19 +669,24 @@ static void process_ethereum_match(const uint8_t priv_bytes[32], const Point &pu
     for (int i = 0; i < 20; i++) sprintf(eth_hash_hex + i * 2, "%02x", eth_hash[i]);
     eth_hash_hex[40] = 0;
 
+    double range_pct = 0.0;
+    int subrange = 1;
+    compute_match_position(priv_bytes, range_pct, subrange);
+
     std::ostringstream oss;
     oss << "-|<.>" << std::string(75, '.') << "\n";
     oss << "-|<.>.FOUND ETHEREUM KEY >\n";
     oss << "-|<.>" << std::string(75, '.') << "\n";
-    oss << "-|<.>.Private Key : " << priv_hex << " >\n";
-    oss << "-|<.>.ETH Address : " << eth_addr << " >\n";
-    oss << "-|<.>.Range       : " << g_range_bits << "/256 >\n";
-    oss << "-|<.>.Thread      : " << thread_id << " >\n";
-    oss << "-|<.>.Timestamp   : " << ts << " >\n";
+    oss << "-|<.>.Private Key   : " << priv_hex << " >\n";
+    oss << "-|<.>.ETH Address   : " << eth_addr << " >\n";
+    oss << "-|<.>.Range         : " << g_range_bits << "/256 >\n";
+    oss << "-|<.>.Subrange      : " << subrange << "/100 (" << std::fixed << std::setprecision(4) << range_pct << "%) >\n";
+    oss << "-|<.>.Thread        : " << thread_id << " >\n";
+    oss << "-|<.>.Timestamp     : " << ts << " >\n";
     oss << "-|<.>" << std::string(75, '.') << "\n";
 
     log_found_match(oss.str());
-    btc_write_found(priv_hex, eth_hash_hex, g_range_bits, thread_id, ts);
+    btc_write_found(priv_hex, eth_hash_hex, g_range_bits, subrange, ts);
 }
 
 static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, const uint8_t h160_matched[20], int thread_id) {
@@ -689,6 +721,10 @@ static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, cons
 
     generate_bech32_p2wpkh(h160_comp, addr_be, sizeof(addr_be));
 
+    double range_pct = 0.0;
+    int subrange = 1;
+    compute_match_position(priv_bytes, range_pct, subrange);
+
     std::ostringstream oss;
     oss << "-|<.>" << std::string(75, '.') << "\n";
     oss << "-|<.>.FOUND BITCOIN KEY >\n";
@@ -699,6 +735,7 @@ static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, cons
     oss << "-|<.>.BTC P2SH-P2WPKH    : " << addr_sh << " >\n";
     oss << "-|<.>.BTC Bech32 P2WPKH  : " << addr_be << " >\n";
     oss << "-|<.>.Range              : " << g_range_bits << "/256 >\n";
+    oss << "-|<.>.Subrange           : " << subrange << "/100 (" << std::fixed << std::setprecision(4) << range_pct << "%) >\n";
     oss << "-|<.>.Thread             : " << thread_id << " >\n";
     oss << "-|<.>.Timestamp          : " << ts << " >\n";
     oss << "-|<.>" << std::string(75, '.') << "\n";
@@ -708,7 +745,7 @@ static void process_bitcoin_match(const uint8_t priv_bytes[32], Point &pub, cons
     matched_hex[40] = 0;
 
     log_found_match(oss.str());
-    btc_write_found(priv_hex, matched_hex, g_range_bits, thread_id, ts);
+    btc_write_found(priv_hex, matched_hex, g_range_bits, subrange, ts);
 }
 
 /*
