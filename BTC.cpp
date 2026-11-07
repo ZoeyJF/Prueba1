@@ -28,7 +28,6 @@
 #include <chrono>
 #include <thread>
 #include <mutex>
-#include <condition_variable>
 #include <atomic>
 #include <vector>
 #include <string>
@@ -43,7 +42,6 @@
 #include <fcntl.h>
 #include <sstream>
 #include <cmath>
-#include <queue>
 
 #include "Secp256k1/Secp256k1.h"
 #include "Secp256k1/BTC.h"
@@ -69,7 +67,7 @@ static std::atomic<bool> g_stop{false};
 static std::atomic<unsigned long long> g_total_keys{0};
 static std::atomic<unsigned long long> g_xor_hits{0};
 static std::atomic<unsigned long long> g_found_count{0};
-static std::atomic<int> g_producers_done{0};
+static std::atomic<int> g_threads_done{0};
 
 static std::mutex g_found_mutex;
 static std::vector<FoundLogEntry> g_found_logs;
@@ -103,27 +101,19 @@ static const char *BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 static const int BATCH_SIZE = 1024;
 static const int BATCH_STEPS = BATCH_SIZE - 1;
 
-// Producer-Consumer Batch Item
-struct BatchWorkItem {
-    uint8_t privs[BATCH_SIZE][32];
-    int count;
-    int thread_id;
+// Heap-allocated scratch space to guarantee tiny stack frame (<4 KB) on mobile ARM64/Termux
+struct WorkerScratch {
     Point pts[BATCH_SIZE];
+    Point step_table[BATCH_STEPS];
+    Int deltaX[BATCH_STEPS];
+    bool zero_flag[BATCH_STEPS];
+    uint8_t batch_privs[BATCH_SIZE][32];
+    Point batch_pts[BATCH_SIZE];
+    Point step_table_bwd[BATCH_STEPS];
 };
-
-static const size_t QUEUE_CAPACITY = 32;
-static BatchWorkItem g_item_pool[QUEUE_CAPACITY];
-static size_t g_queue_head = 0;
-static size_t g_queue_tail = 0;
-static size_t g_queue_size = 0;
-static std::mutex g_queue_mutex;
-static std::condition_variable g_cv_producer;
-static std::condition_variable g_cv_consumer;
 
 static void sig_handler(int) {
     g_stop.store(true, std::memory_order_relaxed);
-    g_cv_producer.notify_all();
-    g_cv_consumer.notify_all();
 }
 
 static void print_usage(const char *prog_name) {
@@ -768,7 +758,7 @@ static inline void compute_batch_points(
 }
 
 /*
- * Dual-Network 4-Way SIMD Accelerated Verification Pipeline
+ * Multi-Way Dual Verification Pipeline (Ethereum Keccak-256 -> Bitcoin Hash160)
  */
 static inline void verify_dual_pipeline_4way(
     const uint8_t privs[4][32],
@@ -812,72 +802,49 @@ static inline void verify_dual_pipeline_4way(
     }
 }
 
-/*
- * Consumer / Helper Thread: Dequeues 1024-point batches and verifies hashes
- */
-static void consumer_worker(int worker_id) {
-    while (!g_stop.load(std::memory_order_relaxed)) {
-        size_t slot_idx = 0;
-        {
-            std::unique_lock<std::mutex> lock(g_queue_mutex);
-            g_cv_consumer.wait(lock, [] {
-                return (g_queue_size > 0) || g_stop.load(std::memory_order_relaxed) ||
-                       (g_producers_done.load(std::memory_order_relaxed) >= g_num_threads);
-            });
+static inline void process_batch_verification(
+    const uint8_t privs[][32],
+    Point pts[],
+    int n_points,
+    int thread_id
+) {
+    for (int i = 0; i < n_points; i += 4) {
+        int chunk_k = (i + 4 <= n_points) ? 4 : (n_points - i);
+        uint8_t sub_privs[4][32];
+        Point sub_pts[4];
 
-            if (g_queue_size == 0) {
-                if (g_stop.load(std::memory_order_relaxed) ||
-                    g_producers_done.load(std::memory_order_relaxed) >= g_num_threads) {
-                    break;
-                }
-                continue;
-            }
-
-            slot_idx = g_queue_head;
-            g_queue_head = (g_queue_head + 1) % QUEUE_CAPACITY;
-            g_queue_size--;
-            g_cv_producer.notify_one();
+        for (int k = 0; k < chunk_k; k++) {
+            copy_256(sub_privs[k], privs[i + k]);
+            sub_pts[k] = pts[i + k];
         }
 
-        BatchWorkItem *item = &g_item_pool[slot_idx];
-        int n_points = item->count;
-        int t_id = item->thread_id;
-
-        // Process 4 points at a time
-        for (int i = 0; i < n_points; i += 4) {
-            int chunk_k = (i + 4 <= n_points) ? 4 : (n_points - i);
-            uint8_t privs[4][32];
-            Point sub_pts[4];
-
+        if (chunk_k == 4) {
+            verify_dual_pipeline_4way(sub_privs, sub_pts, thread_id);
+        } else {
             for (int k = 0; k < chunk_k; k++) {
-                copy_256(privs[k], item->privs[i + k]);
-                sub_pts[k] = item->pts[i + k];
-            }
-
-            if (chunk_k == 4) {
-                verify_dual_pipeline_4way(privs, sub_pts, t_id);
-            } else {
-                for (int k = 0; k < chunk_k; k++) {
-                    uint8_t single_priv[4][32];
-                    Point single_pts[4];
-                    copy_256(single_priv[0], privs[k]);
-                    single_pts[0] = sub_pts[k];
-                    verify_dual_pipeline_4way(single_priv, single_pts, t_id);
-                }
+                uint8_t single_priv[4][32];
+                Point single_pts[4];
+                copy_256(single_priv[0], sub_privs[k]);
+                single_pts[0] = sub_pts[k];
+                verify_dual_pipeline_4way(single_priv, single_pts, thread_id);
             }
         }
-
-        g_total_keys.fetch_add(n_points, std::memory_order_relaxed);
-        g_thread_counters[t_id].fetch_add(n_points, std::memory_order_relaxed);
     }
+
+    g_total_keys.fetch_add(n_points, std::memory_order_relaxed);
+    g_thread_counters[thread_id].fetch_add(n_points, std::memory_order_relaxed);
 }
 
 /*
- * Producer Worker: Pinned to Big/Prime cores for 1024-key Montgomery point generation
+ * Worker Thread: Pinned to Big/Prime core with thread-isolated point generation & verification
  */
-static void producer_worker(int thread_id) {
+static void worker_thread(int thread_id) {
     int core_id = btc_get_big_core_id(thread_id);
     btc_pin_thread(core_id);
+
+    // Allocate scratch space once on heap to guarantee safe stack usage (<4 KB)
+    std::unique_ptr<WorkerScratch> scratch(new WorkerScratch());
+    IntGroup modGroup(BATCH_STEPS);
 
     uint8_t priv_bytes[32];
     Int k_int;
@@ -886,49 +853,27 @@ static void producer_worker(int thread_id) {
     std::mt19937_64 rng((uint64_t)std::chrono::steady_clock::now().time_since_epoch().count() ^ (uint64_t)thread_id);
 
     if (!g_random_mode) {
+        // Sequential Forward Search
         copy_256(priv_bytes, g_start_key);
         add_small_uint(priv_bytes, (uint64_t)thread_id * (uint64_t)BATCH_SIZE);
         if (cmp_256(priv_bytes, g_end_key) >= 0) {
-            g_producers_done.fetch_add(1, std::memory_order_release);
-            g_cv_consumer.notify_all();
+            g_threads_done.fetch_add(1, std::memory_order_release);
             return;
         }
 
         bytes_to_int_obj(priv_bytes, k_int);
         current_pub = g_secp->ComputePublicKey(&k_int);
 
-        Point step_table[BATCH_STEPS];
-        Int deltaX[BATCH_STEPS];
-        Point pts[BATCH_SIZE];
-        bool zero_flag[BATCH_STEPS];
-        IntGroup modGroup(BATCH_STEPS);
-
         for (int i = 0; i < BATCH_STEPS; i++) {
             Int k_step((uint64_t)(i + 1));
-            step_table[i] = g_secp->ComputePublicKey(&k_step);
+            scratch->step_table[i] = g_secp->ComputePublicKey(&k_step);
         }
 
         Int k_stride((uint64_t)BATCH_SIZE * (uint64_t)g_num_threads);
         Point P_stride = g_secp->ComputePublicKey(&k_stride);
 
         while (!g_stop.load(std::memory_order_relaxed)) {
-            compute_batch_points(current_pub, step_table, modGroup, deltaX, zero_flag, pts);
-
-            size_t slot = 0;
-            {
-                std::unique_lock<std::mutex> lock(g_queue_mutex);
-                g_cv_producer.wait(lock, [] {
-                    return (g_queue_size < QUEUE_CAPACITY) || g_stop.load(std::memory_order_relaxed);
-                });
-                if (g_stop.load(std::memory_order_relaxed)) break;
-
-                slot = g_queue_tail;
-                g_queue_tail = (g_queue_tail + 1) % QUEUE_CAPACITY;
-                g_queue_size++;
-            }
-
-            BatchWorkItem *item = &g_item_pool[slot];
-            item->thread_id = thread_id;
+            compute_batch_points(current_pub, scratch->step_table, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
             int valid_count = 0;
             for (int i = 0; i < BATCH_SIZE; i++) {
@@ -936,13 +881,14 @@ static void producer_worker(int thread_id) {
                 copy_256(cur_priv, priv_bytes);
                 add_small_uint(cur_priv, (uint64_t)i);
                 if (cmp_256(cur_priv, g_end_key) >= 0) break;
-                copy_256(item->privs[valid_count], cur_priv);
-                item->pts[valid_count] = pts[i];
+                copy_256(scratch->batch_privs[valid_count], cur_priv);
+                scratch->batch_pts[valid_count] = scratch->pts[i];
                 valid_count++;
             }
-            item->count = valid_count;
 
-            g_cv_consumer.notify_one();
+            if (valid_count > 0) {
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_count, thread_id);
+            }
 
             if (valid_count < BATCH_SIZE) break;
 
@@ -954,17 +900,10 @@ static void producer_worker(int thread_id) {
 
     } else {
         // Random Bidirectional Search
-        Point step_table_fwd[BATCH_STEPS];
-        Point step_table_bwd[BATCH_STEPS];
-        Int deltaX[BATCH_STEPS];
-        Point pts[BATCH_SIZE];
-        bool zero_flag[BATCH_STEPS];
-        IntGroup modGroup(BATCH_STEPS);
-
         for (int i = 0; i < BATCH_STEPS; i++) {
             Int k_step((uint64_t)(i + 1));
-            step_table_fwd[i] = g_secp->ComputePublicKey(&k_step);
-            step_table_bwd[i] = g_secp->Negation(step_table_fwd[i]);
+            scratch->step_table[i] = g_secp->ComputePublicKey(&k_step);
+            scratch->step_table_bwd[i] = g_secp->Negation(scratch->step_table[i]);
         }
 
         Int k_batch((uint64_t)BATCH_SIZE);
@@ -1001,45 +940,22 @@ static void producer_worker(int thread_id) {
 
         while (!g_stop.load(std::memory_order_relaxed)) {
             // Forward batch sweep
-            compute_batch_points(fwd_pub, step_table_fwd, modGroup, deltaX, zero_flag, pts);
+            compute_batch_points(fwd_pub, scratch->step_table, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
             int valid_fwd = 0;
-            uint8_t tmp_fwd_privs[BATCH_SIZE][32];
-            Point tmp_fwd_pts[BATCH_SIZE];
-
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
                 copy_256(cur_priv, fwd_priv);
                 add_small_uint(cur_priv, (uint64_t)i);
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    copy_256(tmp_fwd_privs[valid_fwd], cur_priv);
-                    tmp_fwd_pts[valid_fwd] = pts[i];
+                    copy_256(scratch->batch_privs[valid_fwd], cur_priv);
+                    scratch->batch_pts[valid_fwd] = scratch->pts[i];
                     valid_fwd++;
                 }
             }
 
             if (valid_fwd > 0) {
-                size_t slot = 0;
-                {
-                    std::unique_lock<std::mutex> lock(g_queue_mutex);
-                    g_cv_producer.wait(lock, [] {
-                        return (g_queue_size < QUEUE_CAPACITY) || g_stop.load(std::memory_order_relaxed);
-                    });
-                    if (g_stop.load(std::memory_order_relaxed)) break;
-
-                    slot = g_queue_tail;
-                    g_queue_tail = (g_queue_tail + 1) % QUEUE_CAPACITY;
-                    g_queue_size++;
-                }
-
-                BatchWorkItem *item_fwd = &g_item_pool[slot];
-                item_fwd->thread_id = thread_id;
-                item_fwd->count = valid_fwd;
-                for (int i = 0; i < valid_fwd; i++) {
-                    copy_256(item_fwd->privs[i], tmp_fwd_privs[i]);
-                    item_fwd->pts[i] = tmp_fwd_pts[i];
-                }
-                g_cv_consumer.notify_one();
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_fwd, thread_id);
             }
 
             add_small_uint(fwd_priv, (uint64_t)BATCH_SIZE);
@@ -1048,45 +964,22 @@ static void producer_worker(int thread_id) {
             if (g_stop.load(std::memory_order_relaxed)) break;
 
             // Backward batch sweep
-            compute_batch_points(bwd_pub, step_table_bwd, modGroup, deltaX, zero_flag, pts);
+            compute_batch_points(bwd_pub, scratch->step_table_bwd, modGroup, scratch->deltaX, scratch->zero_flag, scratch->pts);
 
             int valid_bwd = 0;
-            uint8_t tmp_bwd_privs[BATCH_SIZE][32];
-            Point tmp_bwd_pts[BATCH_SIZE];
-
             for (int i = 0; i < BATCH_SIZE; i++) {
                 uint8_t cur_priv[32];
                 copy_256(cur_priv, bwd_priv);
                 sub_small_uint(cur_priv, (uint64_t)i);
                 if (cmp_256(cur_priv, g_start_key) >= 0 && cmp_256(cur_priv, g_end_key) < 0) {
-                    copy_256(tmp_bwd_privs[valid_bwd], cur_priv);
-                    tmp_bwd_pts[valid_bwd] = pts[i];
+                    copy_256(scratch->batch_privs[valid_bwd], cur_priv);
+                    scratch->batch_pts[valid_bwd] = scratch->pts[i];
                     valid_bwd++;
                 }
             }
 
             if (valid_bwd > 0) {
-                size_t slot = 0;
-                {
-                    std::unique_lock<std::mutex> lock(g_queue_mutex);
-                    g_cv_producer.wait(lock, [] {
-                        return (g_queue_size < QUEUE_CAPACITY) || g_stop.load(std::memory_order_relaxed);
-                    });
-                    if (g_stop.load(std::memory_order_relaxed)) break;
-
-                    slot = g_queue_tail;
-                    g_queue_tail = (g_queue_tail + 1) % QUEUE_CAPACITY;
-                    g_queue_size++;
-                }
-
-                BatchWorkItem *item_bwd = &g_item_pool[slot];
-                item_bwd->thread_id = thread_id;
-                item_bwd->count = valid_bwd;
-                for (int i = 0; i < valid_bwd; i++) {
-                    copy_256(item_bwd->privs[i], tmp_bwd_privs[i]);
-                    item_bwd->pts[i] = tmp_bwd_pts[i];
-                }
-                g_cv_consumer.notify_one();
+                process_batch_verification(scratch->batch_privs, scratch->batch_pts, valid_bwd, thread_id);
             }
 
             sub_small_uint(bwd_priv, (uint64_t)BATCH_SIZE);
@@ -1100,8 +993,7 @@ static void producer_worker(int thread_id) {
         }
     }
 
-    g_producers_done.fetch_add(1, std::memory_order_release);
-    g_cv_consumer.notify_all();
+    g_threads_done.fetch_add(1, std::memory_order_release);
 }
 
 static void render_display(std::vector<unsigned long long> &prev_counts, double elapsed_sec, int current_range_bit, int render_cycle) {
@@ -1254,21 +1146,14 @@ int run_single_range(int bits) {
     g_range_bits = bits;
     initialize_range(bits);
 
-    g_producers_done.store(0, std::memory_order_relaxed);
+    g_threads_done.store(0, std::memory_order_relaxed);
     g_thread_counters.reset(new std::atomic<unsigned long long>[g_num_threads]);
     for (int i = 0; i < g_num_threads; i++) g_thread_counters[i].store(0);
 
-    // Launch consumer / assistant hashing workers
-    int num_consumers = g_num_threads > 1 ? (g_num_threads / 2) : 1;
-    std::vector<std::thread> consumers;
-    for (int i = 0; i < num_consumers; i++) {
-        consumers.emplace_back(consumer_worker, i);
-    }
-
-    // Launch producer point-generating workers pinned to Big cores
-    std::vector<std::thread> producers;
+    // Launch worker threads pinned to Big/Prime cores
+    std::vector<std::thread> workers;
     for (int i = 0; i < g_num_threads; i++) {
-        producers.emplace_back(producer_worker, i);
+        workers.emplace_back(worker_thread, i);
     }
 
     std::vector<unsigned long long> prev_counts(g_num_threads, 0);
@@ -1281,9 +1166,8 @@ int run_single_range(int bits) {
     auto next_render = last_time + std::chrono::seconds(15);
 
     while (!g_stop.load(std::memory_order_relaxed)) {
-        if (g_producers_done.load(std::memory_order_acquire) >= g_num_threads) {
-            std::lock_guard<std::mutex> lock(g_queue_mutex);
-            if (g_queue_size == 0) break;
+        if (g_threads_done.load(std::memory_order_acquire) >= g_num_threads) {
+            break;
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -1302,12 +1186,7 @@ int run_single_range(int bits) {
         next_render = now + std::chrono::seconds(15);
     }
 
-    for (auto &t : producers) {
-        if (t.joinable()) t.join();
-    }
-
-    g_cv_consumer.notify_all();
-    for (auto &t : consumers) {
+    for (auto &t : workers) {
         if (t.joinable()) t.join();
     }
 
