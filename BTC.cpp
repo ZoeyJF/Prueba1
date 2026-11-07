@@ -526,6 +526,14 @@ static int load_database_files() {
 
     if (g_idx.count == 0) {
         fprintf(stderr, "[ERROR] Empty index table\n");
+        if (g_bin_map) {
+            if (g_mem_mode_bin == 1) free(g_bin_map);
+            else munmap(g_bin_map, g_bin_size);
+            g_bin_map = nullptr;
+        }
+        if (g_bin_fd >= 0) { close(g_bin_fd); g_bin_fd = -1; }
+        btc_free_xor(&g_xorf);
+        btc_free_idx(&g_idx);
         return -1;
     }
 
